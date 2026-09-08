@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
-const { poolPromise, sql } = require('../db'); // Import database resources
+const path = require('path');
+const { pool } = require('../db');
 
 
 // ============================================================
@@ -13,7 +14,7 @@ module.exports = function (io) {
 
 
     // ============================================================
-    // 1. Configure where and how files are saved
+    // Configure file uploads
     // ============================================================
 
     const storage = multer.diskStorage({
@@ -26,13 +27,11 @@ module.exports = function (io) {
     });
 
 
-    // ============================================================
-    // 2. Initialize multer with file restrictions
-    // ============================================================
-
     const upload = multer({
         storage: storage,
-        limits: { fileSize: 5 * 1024 * 1024 },
+        limits: {
+            fileSize: 5 * 1024 * 1024
+        },
         fileFilter: (req, file, cb) => {
 
             if (file.mimetype.startsWith('image/')) {
@@ -51,58 +50,72 @@ module.exports = function (io) {
 
     router.post('/savecustomer', upload.single('image'), async (req, res) => {
 
-        const { customer } = req.body;
-        const imageFile = req.file;
+        try {
 
-        const mycustomer = JSON.parse(customer);
+            const { customer } = req.body;
+            const imageFile = req.file;
 
-        if (!req.file) {
-            return res.status(400).json({
-                message: 'No file uploaded.',
-                code: 20000
-            });
-        }
+            const mycustomer = JSON.parse(customer);
 
-        let pool = await poolPromise;
+            if (!req.file) {
+                return res.status(400).json({
+                    message: 'No file uploaded.',
+                    code: 20000
+                });
+            }
 
-        let result = await pool.request()
-            .input('firstname', sql.VarChar, mycustomer.firstname)
-            .input('lastname', sql.VarChar, mycustomer.lastname)
-            .input('dob', sql.VarChar, mycustomer.dob)
-            .input('locationid', sql.Int, mycustomer.locationid)
-            .input('avatar', sql.VarChar, imageFile.path.replace(/\\/g, '/'))
-            .input('isactive', sql.Int, mycustomer.isactive)
-            .input('phone', sql.VarChar, mycustomer.phone)
-            .query(`
-                INSERT INTO Customer
+            await pool.query(
+                `
+                INSERT INTO "Customer"
                 (
-                    firstname,
-                    lastName,
-                    dob,
-                    avatar,
-                    phone,
-                    dateCreated,
-                    locationid,
-                    isActive
+                    "Firstname",
+                    "Lastname",
+                    "DOB",
+                    "avatar",
+                    "Phone",
+                    "DateCreated",
+                    "locationid",
+                    "IsActive"
                 )
                 VALUES
                 (
-                    @firstname,
-                    @lastname,
-                    @dob,
-                    @avatar,
-                    @phone,
-                    GETDATE(),
-                    @locationid,
-                    @isactive
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    NOW(),
+                    $6,
+                    $7
                 )
-            `);
+                `,
+                [
+                    mycustomer.firstname,
+                    mycustomer.lastname,
+                    mycustomer.dob || null,
+                    imageFile.path.replace(/\\/g, '/'),
+                    mycustomer.phone,
+                    mycustomer.locationid,
+                    mycustomer.isactive
+                ]
+            );
 
-        res.status(200).json({
-            success: true,
-            message: 'Customer saved successful!',
-            code: 20000
-        });
+            return res.status(200).json({
+                success: true,
+                message: 'Customer saved successful!',
+                code: 20000
+            });
+
+        } catch (error) {
+
+            console.error('Save customer error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Error while saving customer.',
+                code: 50000
+            });
+        }
 
     });
 
@@ -113,18 +126,31 @@ module.exports = function (io) {
 
     router.post('/uploadphoto', upload.single('image'), async (req, res) => {
 
-        if (!req.file) {
-            return res.status(400).json({
-                message: 'No file uploaded.',
+        try {
+
+            if (!req.file) {
+                return res.status(400).json({
+                    message: 'No file uploaded.',
+                    code: 20000
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                message: 'get user successful!',
                 code: 20000
             });
-        }
 
-        res.status(200).json({
-            success: true,
-            message: 'get user successful!',
-            code: 20000
-        });
+        } catch (error) {
+
+            console.error('Upload photo error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Error uploading photo.',
+                code: 50000
+            });
+        }
 
     });
 
@@ -135,44 +161,56 @@ module.exports = function (io) {
 
     router.get('/getall', async (req, res) => {
 
-        const { locationid } = req.query;
+        try {
 
-        let pool = await poolPromise;
+            const { locationid } = req.query;
 
-        let result = await pool.request()
-            .input('locationid', sql.Int, locationid)
-            .query(`
+            const result = await pool.query(
+                `
                 SELECT
-                    id,
-                    firstname,
-                    lastname,
-                    convert(varchar(20),dob,103) as dob,
-                    avatar,
-                    phone,
-                    points,
-                    convert(varchar(20),datecreated,103) as datecreated,
-                    isactive
-                FROM Customer
-                WHERE locationid=@locationid
-            `);
+                    "ID" AS id,
+                    "Firstname" AS firstname,
+                    "Lastname" AS lastname,
+                    TO_CHAR("DOB", 'DD/MM/YYYY') AS dob,
+                    "avatar" AS avatar,
+                    "Phone" AS phone,
+                    "Points" AS points,
+                    TO_CHAR("DateCreated", 'DD/MM/YYYY') AS datecreated,
+                    "IsActive" AS isactive
+                FROM "Customer"
+                WHERE "locationid" = $1
+                `,
+                [locationid]
+            );
 
-        if (result.recordset.length > 0) {
+            if (result.rows.length > 0) {
 
-            res.status(200).json({
-                success: true,
-                message: 'Login successful!',
-                code: 20000,
-                data: result.recordset
-            });
+                return res.status(200).json({
+                    success: true,
+                    message: 'Login successful!',
+                    code: 20000,
+                    data: result.rows
+                });
 
-        } else {
+            } else {
 
-            res.status(200).json({
+                return res.status(200).json({
+                    success: false,
+                    message: 'there is no customers',
+                    code: 20000
+                });
+
+            }
+
+        } catch (error) {
+
+            console.error('Get customers error:', error);
+
+            return res.status(500).json({
                 success: false,
-                message: 'there is no customers',
-                code: 20000
+                message: 'Error while getting customers.',
+                code: 50000
             });
-
         }
 
     });
@@ -184,20 +222,36 @@ module.exports = function (io) {
 
     router.delete('/delete', async (req, res) => {
 
-        const { id } = req.query;
+        try {
 
-        let pool = await poolPromise;
+            const { id } = req.query;
 
-        let result = await pool.request()
-            .input('id', sql.Int, id)
-            .query('DELETE FROM Customer WHERE id=@id');
+            const result = await pool.query(
+                `
+                DELETE FROM "Customer"
+                WHERE "ID" = $1
+                RETURNING "ID"
+                `,
+                [id]
+            );
 
-        res.status(200).json({
-            success: true,
-            message: 'Delete successful!',
-            code: 20000,
-            data: result.recordset
-        });
+            return res.status(200).json({
+                success: true,
+                message: 'Delete successful!',
+                code: 20000,
+                data: result.rows
+            });
+
+        } catch (error) {
+
+            console.error('Delete customer error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Error while deleting customer.',
+                code: 50000
+            });
+        }
 
     });
 
@@ -208,20 +262,37 @@ module.exports = function (io) {
 
     router.put('/updatestatus', async (req, res) => {
 
-        const { id } = req.query;
+        try {
 
-        let pool = await poolPromise;
+            const { id } = req.query;
 
-        let result = await pool.request()
-            .input('id', sql.Int, id)
-            .query('UPDATE Customer SET isactive=~isactive WHERE id=@id');
+            const result = await pool.query(
+                `
+                UPDATE "Customer"
+                SET "IsActive" = NOT "IsActive"
+                WHERE "ID" = $1
+                RETURNING "ID", "IsActive"
+                `,
+                [id]
+            );
 
-        res.status(200).json({
-            success: true,
-            message: 'Update successful!',
-            code: 20000,
-            data: result.recordset
-        });
+            return res.status(200).json({
+                success: true,
+                message: 'Update successful!',
+                code: 20000,
+                data: result.rows
+            });
+
+        } catch (error) {
+
+            console.error('Update customer status error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Error while updating customer status.',
+                code: 50000
+            });
+        }
 
     });
 
@@ -239,7 +310,7 @@ module.exports = function (io) {
 
             const mycheckin = JSON.parse(checkindata);
 
-            console.log("here: " + mycheckin.customernumber);
+            console.log('here: ' + mycheckin.customernumber);
 
             if (!req.file) {
                 return res.status(400).json({
@@ -248,30 +319,31 @@ module.exports = function (io) {
                 });
             }
 
-            let pool = await poolPromise;
-
 
             // ====================================================
             // Find customer
             // ====================================================
 
-            let result = await pool.request()
-                .input('customernumber', sql.VarChar, mycheckin.customernumber)
-                .input('locationid', sql.Int, mycheckin.locationid)
-                .query(`
-                    SELECT
-                        id,
-                        firstname,
-                        lastname
-                    FROM Customer
-                    WHERE customernumber=@customernumber
-                    AND locationid=@locationid
-                `);
+            const result = await pool.query(
+                `
+                SELECT
+                    "ID" AS id,
+                    "Firstname" AS firstname,
+                    "Lastname" AS lastname
+                FROM "Customer"
+                WHERE "CustomerNumber" = $1
+                  AND "locationid" = $2
+                `,
+                [
+                    mycheckin.customernumber,
+                    mycheckin.locationid
+                ]
+            );
 
 
-            if (result.recordset.length > 0) {
+            if (result.rows.length > 0) {
 
-                const customer = result.recordset[0];
+                const customer = result.rows[0];
 
                 console.log(customer);
 
@@ -280,39 +352,35 @@ module.exports = function (io) {
                 // Save check-in
                 // ====================================================
 
-                let result2 = await pool.request()
-                    .input('customerid', sql.Int, customer.id)
-                    .input('locationid', sql.Int, mycheckin.locationid)
-                    .input(
-                        'photo',
-                        sql.VarChar,
-                        imageFile.path.replace(/\\/g, '/')
+                await pool.query(
+                    `
+                    INSERT INTO "CheckIn"
+                    (
+                        "CustomerId",
+                        "LocationId",
+                        "CheckInDate",
+                        "Photo",
+                        "Status"
                     )
-                    .query(`
-                        INSERT INTO Checkin
-                        (
-                            customerid,
-                            locationid,
-                            checkindate,
-                            photo,
-                            Status
-                        )
-                        VALUES
-                        (
-                            @customerid,
-                            @locationid,
-                            GETDATE(),
-                            @photo,
-                            0
-                        )
-                    `);
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        NOW(),
+                        $3,
+                        false
+                    )
+                    `,
+                    [
+                        customer.id,
+                        mycheckin.locationid,
+                        imageFile.path.replace(/\\/g, '/')
+                    ]
+                );
 
 
                 // ====================================================
                 // SOCKET.IO EMIT
-                // ====================================================
-                // Tell all connected Vue clients that a new check-in
-                // has been created.
                 // ====================================================
 
                 const location = `location-${mycheckin.locationid}`;
@@ -327,10 +395,10 @@ module.exports = function (io) {
 
 
                 // ====================================================
-                // Response to the client that performed check-in
+                // Response
                 // ====================================================
 
-                res.status(200).json({
+                return res.status(200).json({
                     success: true,
                     message: 'Checkin successful!',
                     code: 20000
@@ -338,7 +406,7 @@ module.exports = function (io) {
 
             } else {
 
-                res.status(200).json({
+                return res.status(200).json({
                     success: true,
                     message: 'Customer not found!',
                     code: 50000
@@ -350,7 +418,7 @@ module.exports = function (io) {
 
             console.error('Check-in error:', error);
 
-            res.status(500).json({
+            return res.status(500).json({
                 success: false,
                 message: 'Error while checking in customer.',
                 code: 50000
@@ -367,59 +435,118 @@ module.exports = function (io) {
 
     router.get('/getcheckin', async (req, res) => {
 
-        const { locationid } = req.query;
+        try {
 
-        let pool = await poolPromise;
+            const { locationid } = req.query;
 
-        let result = await pool.request()
-            .input('locationid', sql.Int, locationid)
-            .query(`
+            const result = await pool.query(
+                `
                 SELECT
-                    c.id,
-                    (c.firstname +' ' + c.lastname) as fullname,
-                    convert(varchar(20),c.dob,103) as dob,
-                    c.avatar,
-                    c.phone,
-                    c.points,
-                    convert(varchar(20),c.datecreated,103) as datecreated,
-                    c.isactive,
-                    c.locationid as customerlocationid,
-                    ck.id as checkinid,
-                    FORMAT(ck.checkindate, 'hh:mm tt') as checkindate,
-                    FORMAT(ck.approveddate, 'hh:mm tt') as approveddate,
-                    ck.photo,
-                    ck.status,
-                    ck.LocationId as checkinlocationid,
+                    c."ID" AS id,
+
                     CONCAT(
-                        DATEDIFF(MINUTE, checkindate, GETDATE()) / 60,
+                        c."Firstname",
+                        ' ',
+                        c."Lastname"
+                    ) AS fullname,
+
+                    TO_CHAR(c."DOB", 'DD/MM/YYYY') AS dob,
+
+                    c."avatar" AS avatar,
+                    c."Phone" AS phone,
+                    c."Points" AS points,
+
+                    TO_CHAR(
+                        c."DateCreated",
+                        'DD/MM/YYYY'
+                    ) AS datecreated,
+
+                    c."IsActive" AS isactive,
+
+                    c."locationid" AS customerlocationid,
+
+                    ck."ID" AS checkinid,
+
+                    TO_CHAR(
+                        ck."CheckInDate",
+                        'HH12:MI AM'
+                    ) AS checkindate,
+
+                    TO_CHAR(
+                        ck."ApprovedDate",
+                        'HH12:MI AM'
+                    ) AS approveddate,
+
+                    ck."Photo" AS photo,
+                    ck."Status" AS status,
+
+                    ck."LocationId" AS checkinlocationid,
+
+                    CONCAT(
+                        FLOOR(
+                            EXTRACT(
+                                EPOCH FROM
+                                (NOW() - ck."CheckInDate")
+                            ) / 3600
+                        ),
                         ' hr ',
-                        DATEDIFF(MINUTE, checkindate, GETDATE()) % 60,
+                        FLOOR(
+                            MOD(
+                                EXTRACT(
+                                    EPOCH FROM
+                                    (NOW() - ck."CheckInDate")
+                                ) / 60,
+                                60
+                            )
+                        ),
                         ' min'
                     ) AS duration,
-                    u.name as approvedby
 
-                FROM Customer c
-                INNER JOIN Checkin ck ON ck.CustomerId = c.ID
-                LEFT JOIN Users u on u.id=ck.approvedby
-                WHERE ck.locationid = @locationid
-                Order by ck.checkindate desc
-            `);
+                    u."Name" AS approvedby
 
-        if (result.recordset.length > 0) {
+                FROM "Customer" c
 
-            res.status(200).json({
-                success: true,
-                message: 'Login successful!',
-                code: 20000,
-                data: result.recordset
-            });
+                INNER JOIN "CheckIn" ck
+                    ON ck."CustomerId" = c."ID"
 
-        } else {
+                LEFT JOIN "Users" u
+                    ON u."ID" = ck."ApprovedBy"
 
-            res.status(200).json({
+                WHERE ck."LocationId" = $1
+
+                ORDER BY ck."CheckInDate" DESC
+                `,
+                [locationid]
+            );
+
+
+            if (result.rows.length > 0) {
+
+                return res.status(200).json({
+                    success: true,
+                    message: 'Login successful!',
+                    code: 20000,
+                    data: result.rows
+                });
+
+            } else {
+
+                return res.status(200).json({
+                    success: false,
+                    message: 'there is no customers',
+                    code: 20000
+                });
+
+            }
+
+        } catch (error) {
+
+            console.error('Get check-in error:', error);
+
+            return res.status(500).json({
                 success: false,
-                message: 'there is no customers',
-                code: 20000
+                message: 'Error while getting check-ins.',
+                code: 50000
             });
 
         }
@@ -428,29 +555,56 @@ module.exports = function (io) {
 
 
     // ============================================================
-    // Approve Checkin
+    // APPROVE CHECK-IN
     // ============================================================
-
 
     router.put('/approvecheckin', async (req, res) => {
 
-        const { id, userid } = req.query;
+        try {
 
-        let pool = await poolPromise;
+            const { id, userid } = req.query;
 
-        let result = await pool.request()
-            .input('id', sql.Int, id)
-            .input('userid', sql.Int, userid)
-            .query('UPDATE Checkin SET status=1, ApprovedBy=@userid, ApprovedDate=getdate() WHERE id=@id');
+            const result = await pool.query(
+                `
+                UPDATE "CheckIn"
+                SET
+                    "Status" = true,
+                    "ApprovedBy" = $1,
+                    "ApprovedDate" = NOW()
+                WHERE "ID" = $2
+                RETURNING
+                    "ID",
+                    "Status",
+                    "ApprovedBy",
+                    "ApprovedDate"
+                `,
+                [
+                    userid,
+                    id
+                ]
+            );
 
-        res.status(200).json({
-            success: true,
-            message: 'Update successful!',
-            code: 20000,
-            data: result.recordset
-        });
+            return res.status(200).json({
+                success: true,
+                message: 'Update successful!',
+                code: 20000,
+                data: result.rows
+            });
+
+        } catch (error) {
+
+            console.error('Approve check-in error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Error while approving check-in.',
+                code: 50000
+            });
+
+        }
 
     });
+
 
     // ============================================================
     // Return Router

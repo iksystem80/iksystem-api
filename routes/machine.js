@@ -1,78 +1,149 @@
 const express = require('express');
 const router = express.Router();
-const { poolPromise, sql } = require('../db'); // Import database resources
+const { pool } = require('../db');
+
+
+// ============================================================
+// GENERATE MACHINES
+// ============================================================
 
 router.post('/generatemachines', async (req, res) => {
 
-    //console.log(req.body);
-    const { start, end, locationid } = req.body;
+    try {
 
-    //let pool = await sql.connect(dbConfig);
-    let pool = await poolPromise;
+        const {
+            start,
+            end,
+            locationid
+        } = req.body;
 
-    // Execute parameterized query to protect against SQL Injection
-    let result = await pool.request()
-        .input('start', sql.Int, start)
-        .input('end', sql.Int, end)
-        .input('locationid', sql.Int, locationid)
-        .query(`;WITH Numbers AS
-        (
-            SELECT TOP (@end - @start + 1)
-                   ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
-            FROM sys.all_objects a
-            CROSS JOIN sys.all_objects b
-        )
 
-        INSERT INTO Machines (MachineNumber, locationid, StatusId)
-        SELECT @start + n - 1, @locationid , 1
-        FROM Numbers N
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-            FROM Machines M
-            WHERE M.MachineNumber = @start + N.n - 1 And locationid=@locationid
-        );`);
+        // PostgreSQL generate_series() replaces the SQL Server
+        // sys.all_objects number-generation technique.
 
-    res.status(200).json({
-        success: true,
-        message: 'Machine generated successful. System skipped the duplicate machine numbers!',
-        code: 20000
-    });
+        await pool.query(
+            `
+            INSERT INTO "Machines"
+            (
+                "MachineNumber",
+                "locationid",
+                "StatusId"
+            )
+            SELECT
+                number,
+                $3,
+                1
+             FROM generate_series($1::integer, $2::integer) AS number
+            WHERE NOT EXISTS
+            (
+                SELECT 1
+                FROM "Machines" m
+                WHERE m."MachineNumber" = number
+                  AND m."locationid" = $3
+            )
+            `,
+            [
+                start,
+                end,
+                locationid
+            ]
+        );
+
+
+        return res.status(200).json({
+            success: true,
+            message: 'Machine generated successful. System skipped the duplicate machine numbers!',
+            code: 20000
+        });
+
+    } catch (error) {
+
+        console.error('Generate machines error:', error);
+
+        return res.status(500).json({
+            success: false,
+            message: 'Error while generating machines.',
+            code: 50000
+        });
+
+    }
+
 });
+
+
+// ============================================================
+// GET ALL MACHINES
+// ============================================================
 
 router.get('/getall', async (req, res) => {
 
-    // console.log("body: " + req.query)
-    const { locationid } = req.query
+    try {
 
-    console.log(locationid)
+        const {
+            locationid
+        } = req.query;
 
-    //let pool = await sql.connect(dbConfig);
-    let pool = await poolPromise;
+        console.log(locationid);
 
-    // Execute parameterized query to protect against SQL Injection
-    let result = await pool.request()
-        .input('locationid', sql.Int, locationid)
-        .query(`SELECT m.id, m.machinenumber, mt.typename as machinetype, g.gamename, ms.description as status 
-                FROM Machines m
-                inner join MachineStatus ms on ms.ID = m.StatusId
-                left join MachineTypes mt on mt.Id=m.MachineTypeId
-                left join Games g on g.id=m.GameId WHERE locationid=@locationid`);
 
-    if (result.recordset.length > 0) {
+        const result = await pool.query(
+            `
+            SELECT
+                m."ID" AS id,
+                m."MachineNumber" AS machinenumber,
+                mt."TypeName" AS machinetype,
+                g."GameName" AS gamename,
+                ms."Description" AS status
 
-        res.status(200).json({
-            success: true,
-            message: 'get successful!',
-            code: 20000,
-            data: result.recordset
+            FROM "Machines" m
+
+            INNER JOIN "MachineStatus" ms
+                ON ms."ID" = m."StatusId"
+
+            LEFT JOIN "MachineTypes" mt
+                ON mt."ID" = m."MachineTypeId"
+
+            LEFT JOIN "Games" g
+                ON g."ID" = m."GameId"
+
+            WHERE m."locationid" = $1
+            ORDER BY m."MachineNumber" asc
+            `,
+            [locationid]
+        );
+
+
+        if (result.rows.length > 0) {
+
+            return res.status(200).json({
+                success: true,
+                message: 'get successful!',
+                code: 20000,
+                data: result.rows
+            });
+
+        } else {
+
+            return res.status(200).json({
+                success: false,
+                message: 'no machines found.',
+                code: 20000
+            });
+
+        }
+
+    } catch (error) {
+
+        console.error('Get machines error:', error);
+
+        return res.status(500).json({
+            success: false,
+            message: 'Error while getting machines.',
+            code: 50000
         });
 
-        // console.log(res)
-    } else {
-        // Authentication failed
-        res.status(200).json({ success: false, message: 'no machines found.', code: 20000 });
     }
+
 });
 
 

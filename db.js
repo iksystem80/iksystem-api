@@ -1,37 +1,28 @@
-const sql = require('mssql');
 require('dotenv').config();
 
-const dbConfig = {
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    server: process.env.DB_SERVER,
-    database: process.env.DB_DATABASE,
+const { Pool } = require('pg');
 
-    options: {
-        encrypt: true,
-        trustServerCertificate: true
+const pool = new Pool({
+    user: process.env.PG_USER,
+    password: process.env.PG_PASSWORD,
+    host: process.env.PG_HOST,
+    port: Number(process.env.PG_PORT || 5432),
+    database: process.env.PG_DATABASE,
+    ssl: {
+        rejectUnauthorized: false
     },
+    max: 10,
+    idleTimeoutMillis: 30000
+});
 
-    pool: {
-        max: 10,
-        min: 0,
-        idleTimeoutMillis: 30000
-    }
-};
+pool.on('connect', () => {
+    console.log('Connected to PostgreSQL successfully!');
+});
 
-// Create a connection pool managed asynchronously
-const poolPromise = new sql.ConnectionPool(dbConfig)
-    .connect()
-    .then(pool => {
-        console.log('Connected to MS SQL Server successfully!');
-        return pool;
-    })
-    .catch(err => {
-        console.error('Database Connection Failed! Bad Config: ', err);
-        process.exit(1);
-    });
+pool.on('error', (err) => {
+    console.error('Unexpected PostgreSQL pool error:', err);
+});
 
 module.exports = {
-    sql,
-    poolPromise
+    pool
 };
