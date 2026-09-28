@@ -29,6 +29,25 @@ app.use(bodyParser.urlencoded({extended: true,limit: '25mb',}))
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
 
+
+app.use((req, res, next) => {
+    if (req.originalUrl.includes('/api/user/login')) {
+        console.log('IOS LOGIN DIAGNOSTIC:', {
+            url: req.originalUrl,
+            origin: req.headers.origin,
+            userAgent: req.headers['user-agent'],
+            username:
+                req.body?.username ||
+                req.body?.email ||
+                req.body?.userName ||
+                null,
+            bodyKeys: Object.keys(req.body || {})
+        });
+    }
+
+    next();
+});
+
 // ============================================
 // HTTP Server
 // ============================================
