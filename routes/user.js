@@ -1,184 +1,703 @@
-const express = require('express');
-const router = express.Router();
-const { pool } = require('../db');
+const express = require('express')
+const bcrypt = require('bcryptjs')
 
-const tokens = {
-    admin: {
-        token: 'admin-token'
-    },
-    editor: {
-        token: 'editor-token'
-    }
-};
+const router = express.Router()
 
-const users = {
-    'admin-token': {
-        roles: ['admin'],
-        avatar: 'https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif',
-        name: 'Admin',
-        locationid: 0,
-        location: ''
-    },
-    'employee-token': {
-        roles: ['employee'],
-        avatar: 'https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif',
-        name: 'Employee',
-        locationid: 0,
-        location: ''
-    }
-};
+const { pool } = require('../db')
 
+// ============================================================
+// HELPERS
+// ============================================================
 
-// ============================================
-// Login
-// ============================================
+function looksLikeBcrypt(value = '') {
+    return /^\$2[aby]\$/.test(value)
+}
 
-router.post('/login', async (req, res) => {
+function normalizeRoleName(value = '') {
+    return String(value)
+        .trim()
+        .toLowerCase()
+}
 
-    const { username, password } = req.body;
+// ============================================================
+// LOGIN
+// ============================================================
 
-    if (!username || !password) {
-        return res.status(400).json({
-            message: 'username and password are required.'
-        });
-    }
+router.post(
+    '/login',
+    async (req, res) => {
+        const {
+            username,
+            password
+        } = req.body
 
-    try {
+        if (
+            !username ||
+            !password
+        ) {
+            return res.status(400).json({
+                success: false,
+                code: 40000,
+                message:
+                    'Username and password are required.'
+            })
+        }
 
-        const result = await pool.query(
-            `
-            SELECT
-                u."ID",
-                u."Username",
-                u."token",
-                u."LocationId",
-                l."name" AS "locationname"
-            FROM "Users" u
-            INNER JOIN "Locations" l
-                ON l."ID" = u."LocationId"
-            WHERE u."Username" = $1
-              AND u."Password" = $2
-            `,
-            [username, password]
-        );
+        try {
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        u."ID",
+                        u."Username",
+                        u."Password",
+                        u."token",
+                        u."LocationId",
+                        u."RoleId",
+                        u."IsActive",
 
-        if (result.rows.length > 0) {
+                        r."Name"
+                            AS "RoleName",
 
-            const user = result.rows[0];
+                        l."name"
+                            AS "locationname",
+
+                        l."CompanyId"
+                            AS "CompanyId",
+
+                        c."Name"
+                            AS "CompanyName",
+
+                        c."IsActive"
+                            AS "CompanyIsActive",
+
+                        l."IsActive"
+                            AS "LocationIsActive"
+
+                    FROM
+                        "Users" u
+
+                    INNER JOIN
+                        "Roles" r
+
+                        ON
+                            r."ID" =
+                                u."RoleId"
+
+                    LEFT JOIN
+                        "Locations" l
+
+                        ON
+                            l."ID" =
+                                u."LocationId"
+
+                    LEFT JOIN
+                        "Companies" c
+
+                        ON
+                            c."ID" =
+                                l."CompanyId"
+
+                    WHERE
+                        LOWER(
+                            u."Username"
+                        ) =
+                        LOWER($1)
+
+                    LIMIT 1
+                    `,
+                    [
+                        username.trim()
+                    ]
+                )
+
+            if (
+                !result.rowCount ||
+                !result.rows[0].IsActive
+            ) {
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        'Invalid username or password.',
+                    code: 40100
+                })
+            }
+
+            const user =
+                result.rows[0]
+
+            let validPassword =
+                false
+
+            // ====================================================
+            // PASSWORD CHECK
+            // ====================================================
+
+            if (
+                looksLikeBcrypt(
+                    user.Password
+                )
+            ) {
+                validPassword =
+                    await bcrypt.compare(
+                        password,
+                        user.Password
+                    )
+            } else {
+                validPassword =
+                    password ===
+                    user.Password
+            }
+
+            if (
+                !validPassword
+            ) {
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        'Invalid username or password.',
+                    code: 40100
+                })
+            }
+
+            const roleName =
+                normalizeRoleName(
+                    user.RoleName
+                )
+
+            // ====================================================
+            // NORMAL COMPANY USER VALIDATION
+            //
+            // System Admin is allowed to exist outside a normal
+            // company/location relationship.
+            // ====================================================
+
+            if (
+                roleName !==
+                'system admin'
+            ) {
+                if (
+                    !user.LocationId
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your account is not assigned to a location.'
+                    })
+                }
+
+                if (
+                    user.LocationIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your assigned location is inactive.'
+                    })
+                }
+
+                if (
+                    !user.CompanyId
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your account is not assigned to a company.'
+                    })
+                }
+
+                if (
+                    user.CompanyIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is inactive.'
+                    })
+                }
+            }
+
+            // ====================================================
+            // UPGRADE OLD PLAINTEXT PASSWORD
+            // ====================================================
+
+            if (
+                !looksLikeBcrypt(
+                    user.Password
+                )
+            ) {
+                const hash =
+                    await bcrypt.hash(
+                        password,
+                        10
+                    )
+
+                await pool.query(
+                    `
+                    UPDATE
+                        "Users"
+
+                    SET
+                        "Password" = $1,
+                        "DateUpdated" = NOW()
+
+                    WHERE
+                        "ID" = $2
+                    `,
+                    [
+                        hash,
+                        user.ID
+                    ]
+                )
+            }
+
+            // ====================================================
+            // SUCCESS
+            // ====================================================
 
             return res.status(200).json({
                 success: true,
-                message: 'Login successful!',
+                message:
+                    'Login successful!',
                 code: 20000,
-                token: user.token,
-                userid: user.ID,
-                locationid: user.LocationId,
-                locationname: user.locationname
-            });
 
-        } else {
+                token:
+                    user.token,
 
-            return res.status(200).json({
+                userid:
+                    user.ID,
+
+                locationid:
+                    user.LocationId,
+
+                locationname:
+                    user.locationname,
+
+                companyid:
+                    user.CompanyId || null,
+
+                companyname:
+                    user.CompanyName || '',
+
+                roleid:
+                    user.RoleId,
+
+                rolename:
+                    user.RoleName
+            })
+
+        } catch (err) {
+            console.error(
+                'Login error:',
+                err
+            )
+
+            return res.status(500).json({
                 success: false,
-                message: 'Invalid username or password.',
-                code: 50000
-            });
+                code: 50000,
+                message:
+                    'Internal server error. ' +
+                    err.message
+            })
+        }
+    }
+)
+
+// ============================================================
+// USER INFO
+// ============================================================
+
+router.get(
+    '/userinfo',
+    async (req, res) => {
+        const {
+            token,
+            userid
+        } = req.query
+
+        if (
+            !token ||
+            !userid
+        ) {
+            return res.status(400).json({
+                success: false,
+                code: 40000,
+                message:
+                    'Token and user ID are required.'
+            })
         }
 
-    } catch (err) {
+        try {
 
-        console.error(err);
+            // ====================================================
+            // LOAD CURRENT USER FIRST
+            // ====================================================
 
-        return res.status(500).json({
-            message: 'Internal server error 1.' + err.message
-        });
-    }
-});
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        u."ID",
+                        u."Name",
+                        u."token",
+                        u."Avatar",
+                        u."LocationId",
+                        u."RoleId",
 
+                        r."Name"
+                            AS "RoleName",
 
-// ============================================
-// User Info
-// ============================================
+                        l."name"
+                            AS "locationname",
 
-router.get('/userinfo', async (req, res) => {
+                        l."CompanyId"
+                            AS "CompanyId",
 
-    const { token, userid } = req.query;
+                        l."AllowFaceCheckin"
+                            AS "AllowFaceCheckin",
 
-    try {
+                        c."Name"
+                            AS "CompanyName",
 
-        const resultLoc = await pool.query(
-            `
-            SELECT
-                "ID",
-                "name",
-                "IsActive"
-            FROM "Locations"
-            `
-        );
+                        c."IsActive"
+                            AS "CompanyIsActive",
 
-        const result = await pool.query(
-            `
-            SELECT
-                u."ID",
-                u."Name",
-                u."token",
-                u."roles",
-                u."Avatar",
-                u."LocationId",
-                l."name" AS "locationname"
-            FROM "Users" u
-            INNER JOIN "Locations" l
-                ON l."ID" = u."LocationId"
-            WHERE u."ID" = $1
-              AND u."IsActive" = true
-            `,
-            [userid]
-        );
+                        l."IsActive"
+                            AS "LocationIsActive"
 
-        if (result.rows.length > 0) {
+                    FROM
+                        "Users" u
 
-            const dbUser = result.rows[0];
+                    INNER JOIN
+                        "Roles" r
 
-            const info = users[token] || {
-                roles: [],
-                avatar: '',
-                name: '',
-                locationid: 0,
-                location: ''
-            };
+                        ON
+                            r."ID" =
+                                u."RoleId"
 
-            info.roles[0] = dbUser.roles;
-            info.name = dbUser.Name;
-            info.avatar = dbUser.Avatar;
-            info.locationid = dbUser.LocationId;
-            info.location = dbUser.locationname;
+                    LEFT JOIN
+                        "Locations" l
+
+                        ON
+                            l."ID" =
+                                u."LocationId"
+
+                    LEFT JOIN
+                        "Companies" c
+
+                        ON
+                            c."ID" =
+                                l."CompanyId"
+
+                    WHERE
+                        u."ID" = $1
+
+                        AND
+
+                        u."token" = $2
+
+                        AND
+
+                        u."IsActive" = true
+
+                        AND
+
+                        r."IsActive" = true
+
+                    LIMIT 1
+                    `,
+                    [
+                        userid,
+                        token
+                    ]
+                )
+
+            if (
+                !result.rowCount
+            ) {
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        'Unable to get user information.',
+                    code: 40100
+                })
+            }
+
+            const dbUser =
+                result.rows[0]
+
+            const roleName =
+                dbUser.RoleName
+
+            const normalizedRole =
+                normalizeRoleName(
+                    roleName
+                )
+
+            // ====================================================
+            // VALIDATE COMPANY / LOCATION FOR NORMAL USERS
+            // ====================================================
+
+            if (
+                normalizedRole !==
+                'system admin'
+            ) {
+                if (
+                    !dbUser.LocationId
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your account is not assigned to a location.'
+                    })
+                }
+
+                if (
+                    dbUser.LocationIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your assigned location is inactive.'
+                    })
+                }
+
+                if (
+                    !dbUser.CompanyId
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your account is not assigned to a company.'
+                    })
+                }
+
+                if (
+                    dbUser.CompanyIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is inactive.'
+                    })
+                }
+            }
+
+            // ====================================================
+            // LOAD ROLE PERMISSIONS
+            // ====================================================
+
+            const permissionResult =
+                await pool.query(
+                    `
+                    SELECT
+                        p."Code"
+                            AS "code"
+
+                    FROM
+                        "RolePermissions" rp
+
+                    INNER JOIN
+                        "Permissions" p
+
+                        ON
+                            p."ID" =
+                                rp."PermissionId"
+
+                    WHERE
+                        rp."RoleId" = $1
+
+                    ORDER BY
+                        p."Code"
+                    `,
+                    [
+                        dbUser.RoleId
+                    ]
+                )
+
+            const permissions =
+                permissionResult.rows.map(
+                    row =>
+                        row.code
+                )
+
+            // ====================================================
+            // LOAD AVAILABLE LOCATIONS
+            //
+            // System Admin:
+            //   all company locations
+            //
+            // Other roles:
+            //   only locations in their own company
+            // ====================================================
+
+            let resultLoc
+
+            if (
+                normalizedRole ===
+                'system admin'
+            ) {
+                resultLoc =
+                    await pool.query(
+                        `
+                        SELECT
+                            l."ID",
+                            l."name",
+                            l."IsActive",
+                            l."CompanyId",
+                            l."AllowFaceCheckin"
+                            AS "AllowFaceCheckin",
+                            c."Name"
+                                AS "companyName"
+
+                        FROM
+                            "Locations" l
+
+                        LEFT JOIN
+                            "Companies" c
+
+                            ON
+                                c."ID" =
+                                    l."CompanyId"
+
+                        WHERE
+                            l."IsActive" = true
+
+                            AND
+                            (
+                                c."ID" IS NULL
+
+                                OR
+
+                                c."IsActive" = true
+                            )
+
+                        ORDER BY
+                            c."Name",
+                            l."name"
+                        `
+                    )
+
+            } else {
+                resultLoc =
+                    await pool.query(
+                        `
+                        SELECT
+                            l."ID",
+                            l."name",
+                            l."IsActive",
+                            l."CompanyId",
+                            l."AllowFaceCheckin"
+                            AS "AllowFaceCheckin",
+                            c."Name"
+                                AS "companyName"
+
+                        FROM
+                            "Locations" l
+
+                        INNER JOIN
+                            "Companies" c
+
+                            ON
+                                c."ID" =
+                                    l."CompanyId"
+
+                        WHERE
+                            l."CompanyId" = $1
+
+                            AND
+
+                            l."IsActive" = true
+
+                            AND
+
+                            c."IsActive" = true
+
+                        ORDER BY
+                            l."name"
+                        `,
+                        [
+                            dbUser.CompanyId
+                        ]
+                    )
+            }
+
+            // ====================================================
+            // RESPONSE
+            // ====================================================
 
             return res.status(200).json({
                 success: true,
-                message: 'Login successful!',
+                message:
+                    'User information loaded.',
                 code: 20000,
-                data: info,
-                locations: resultLoc.rows
-            });
 
-        } else {
+                data: {
+                    roles: [
+                        roleName.toLowerCase()
+                    ],
 
-            return res.status(200).json({
+                    roleid:
+                        dbUser.RoleId,
+
+                    rolename:
+                        roleName,
+
+                    permissions,
+
+                    avatar:
+                        dbUser.Avatar || '',
+
+                    name:
+                        dbUser.Name || '',
+
+                    companyid:
+                        dbUser.CompanyId || null,
+
+                    companyname:
+                        dbUser.CompanyName || '',
+
+                    locationid:
+                        dbUser.LocationId,
+
+                    location:
+                        dbUser.locationname || '',
+
+                    allowfacecheckin:
+                        dbUser.AllowFaceCheckin
+                },
+
+                locations:
+                    resultLoc.rows
+            })
+
+        } catch (err) {
+            console.error(
+                'User info error:',
+                err
+            )
+
+            return res.status(500).json({
                 success: false,
-                message: 'There is an error while getting user info.',
-                code: 50000
-            });
+                code: 50000,
+                message:
+                    'Internal server error. ' +
+                    err.message
+            })
         }
-
-    } catch (err) {
-
-        console.error(err);
-
-        return res.status(500).json({
-            message: 'Internal server error 2.' + err.message
-        });
     }
-});
+)
 
-
-module.exports = router;
+module.exports = router

@@ -8,11 +8,13 @@ const pool = new Pool({
     host: process.env.PG_HOST,
     port: Number(process.env.PG_PORT || 5432),
     database: process.env.PG_DATABASE,
+
     ssl: {
         rejectUnauthorized: false
     },
+
     max: 10,
-    idleTimeoutMillis: 30000
+    idleTimeoutMillis: 30000,
 });
 
 pool.on('connect', () => {
@@ -23,6 +25,20 @@ pool.on('error', (err) => {
     console.error('Unexpected PostgreSQL pool error:', err);
 });
 
+pool.query(`
+    SELECT
+        current_database() AS database,
+        current_user AS db_user
+`)
+    .then((result) => {
+        console.log('RENDER DATABASE CHECK:', result.rows[0]);
+    })
+    .catch((err) => {
+        console.error('RENDER DATABASE ERROR:', err.message);
+    });
+
+
+
 module.exports = {
-    pool
+    pool,
 };
