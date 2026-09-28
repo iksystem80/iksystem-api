@@ -21,17 +21,17 @@ const app = express()
 //   cert: fs.readFileSync('./certs/localhost.pem'),
 // }
 
-//app.use(cors())
-app.use(cors({
-    origin: [
-        'https://localhost:5173',
-        'https://192.168.1.37:5173',
-        'http://192.168.1.37:5173',
-        'https://localhost',
-        'http://localhost'
-    ],
-    credentials: true
-}));
+app.use(cors())
+// app.use(cors({
+//     origin: [
+//         'https://localhost:5173',
+//         'https://192.168.1.37:5173',
+//         'http://192.168.1.37:5173',
+//         'https://localhost',
+//         'http://localhost'
+//     ],
+//     credentials: true
+// }));
 
 
 //app.use(bodyParser.json())
