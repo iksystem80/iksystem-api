@@ -6,6 +6,7 @@ const cloudinary = require('../config/cloudinary')
 const pgvector = require('pgvector')
 const { initFaceApi, createFaceEmbedding, FaceDetectionError } = require('../face')
 const { requirePermission } = require('../middleware/auth')
+const { checkMatchEligibility } = require('../utils/matchRules')
 
 const uploadToCloudinary = (fileBuffer, folder) => {
     return new Promise((resolve, reject) => {
@@ -626,6 +627,10 @@ module.exports = function (io) {
                             "Firstname" AS firstname,
                             "Lastname" AS lastname,
                             "Phone" AS phone,
+                            "IsActive" AS isactive,
+                            "IsBlacklist" AS isblacklist,
+                            "PhoneVerified" AS phoneverified,
+                            "VerificationMethod" AS verificationmethod,
                             "Embedding" <-> $1::vector AS distance
 
                         FROM "Customer"
@@ -633,7 +638,6 @@ module.exports = function (io) {
                         WHERE
                             locationid = $2
                             AND "Embedding" IS NOT NULL
-                            AND "IsActive" = true
 
                         ORDER BY
                             "Embedding" <-> $1::vector
@@ -676,6 +680,40 @@ module.exports = function (io) {
                             })
                     }
 
+                    if (customer.isactive !== true) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'This customer account is inactive and cannot check in.',
+                            code: 40300,
+                        })
+                    }
+
+                    if (customer.isblacklist === true) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'This customer is blacklisted and cannot check in.',
+                            code: 40300,
+                        })
+                    }
+
+                    const verificationBypassed =
+                        String(customer.verificationmethod || '')
+                            .toLowerCase() === 'bypass'
+
+                    if (
+                        customer.phoneverified !== true &&
+                        !verificationBypassed
+                    ) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'Customer verification is required before check-in.',
+                            code: 40300,
+                        })
+                    }
+
                     const imgresult =
                         await uploadToCloudinary(
                             req.file.buffer,
@@ -710,14 +748,17 @@ module.exports = function (io) {
                             "ID" AS id,
                             "Firstname" AS firstname,
                             "Lastname" AS lastname,
-                            "Phone" AS phone
+                            "Phone" AS phone,
+                            "IsActive" AS isactive,
+                            "IsBlacklist" AS isblacklist,
+                            "PhoneVerified" AS phoneverified,
+                            "VerificationMethod" AS verificationmethod
 
                         FROM "Customer"
 
                         WHERE
                             locationid = $1
                             AND "Phone" = $2
-                            AND "IsActive" = true
 
                         LIMIT 1
                         `,
@@ -741,6 +782,40 @@ module.exports = function (io) {
 
                     customer =
                         result.rows[0]
+
+                    if (customer.isactive !== true) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'This customer account is inactive and cannot check in.',
+                            code: 40300,
+                        })
+                    }
+
+                    if (customer.isblacklist === true) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'This customer is blacklisted and cannot check in.',
+                            code: 40300,
+                        })
+                    }
+
+                    const verificationBypassed =
+                        String(customer.verificationmethod || '')
+                            .toLowerCase() === 'bypass'
+
+                    if (
+                        customer.phoneverified !== true &&
+                        !verificationBypassed
+                    ) {
+                        return res.status(403).json({
+                            success: false,
+                            matched: true,
+                            message: 'Customer verification is required before check-in.',
+                            code: 40300,
+                        })
+                    }
                 }
 
                 // ====================================================
@@ -997,6 +1072,29 @@ module.exports = function (io) {
                                 'DD/MM/YYYY'
                             ) AS datecreated,
 
+                            TO_CHAR(
+                                c."DateCreated",
+                                'MM/DD/YYYY'
+                            ) AS "registrationDate",
+
+                            (
+                                SELECT COUNT(*)
+                                FROM "CheckIn" visit
+                                WHERE visit."CustomerId" = c."ID"
+                                  AND visit."LocationId" = ck."LocationId"
+                            )::int AS "totalVisits",
+
+                            (
+                                SELECT TO_CHAR(
+                                    MAX(previous_visit."CheckInDate"),
+                                    'MM/DD/YYYY HH12:MI AM'
+                                )
+                                FROM "CheckIn" previous_visit
+                                WHERE previous_visit."CustomerId" = c."ID"
+                                  AND previous_visit."LocationId" = ck."LocationId"
+                                  AND previous_visit."CheckInDate" < ck."CheckInDate"
+                            ) AS "lastVisit",
+
                             c."IsActive"
                                 AS isactive,
 
@@ -1084,7 +1182,9 @@ module.exports = function (io) {
                                ck."ApprovedBy"
 
                         WHERE
-                            ck."LocationId" = $1 AND ck."IsCheckOut"=false
+                            ck."LocationId" = $1
+                            AND ck."IsCheckOut" = false
+                            AND ck."CheckInDate" >= NOW() - INTERVAL '24 hours' 
 
                         ORDER BY
                             ck."CheckInDate" DESC
@@ -1205,6 +1305,55 @@ module.exports = function (io) {
     )
 
     // ============================================================
+    // CHECK MATCH ELIGIBILITY
+    // Reusable by any frontend page before attempting a Match.
+    // The save routes still validate again server-side.
+    // Permission: customers.update
+    // ============================================================
+
+    router.get(
+        '/checkmatcheligibility',
+        requirePermission('customers.update'),
+        async (req, res) => {
+            try {
+                const customerId = Number(req.query.customerid)
+                const locationId = Number(req.query.locationid)
+
+                if (!Number.isInteger(customerId) || customerId <= 0 ||
+                    !Number.isInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Valid customer and location are required.',
+                        code: 40000
+                    })
+                }
+
+                const data = await checkMatchEligibility(pool, {
+                    customerId,
+                    locationId
+                })
+
+                return res.status(200).json({
+                    success: true,
+                    message: data.eligible
+                        ? 'Customer is eligible for Match.'
+                        : data.message,
+                    code: 20000,
+                    data
+                })
+            } catch (error) {
+                console.error('Check Match eligibility error:', error)
+
+                return res.status(500).json({
+                    success: false,
+                    message: 'Unable to check Match eligibility.',
+                    code: 50000
+                })
+            }
+        }
+    )
+
+    // ============================================================
     // SAVE / ASSIGN MACHINE
     // Permission: customers.update
     // ============================================================
@@ -1262,6 +1411,21 @@ module.exports = function (io) {
                 if (!validAssignment.rowCount) {
                     await client.query('ROLLBACK')
                     return res.status(400).json({ success: false, message: 'Customer, check-in or machine is not valid for this location.', code: 40000 })
+                }
+
+                const matchEligibility = await checkMatchEligibility(client, {
+                    customerId,
+                    locationId
+                })
+
+                if (!matchEligibility.eligible) {
+                    await client.query('ROLLBACK')
+                    return res.status(409).json({
+                        success: false,
+                        message: matchEligibility.message,
+                        code: 40900,
+                        data: matchEligibility
+                    })
                 }
 
                 const imageResult = await uploadToCloudinary(req.file.buffer, 'customers')
@@ -1377,126 +1541,138 @@ module.exports = function (io) {
         '/updatecustomeraccount',
         requirePermission('customers.update'),
         async (req, res) => {
-            const client =
-                await pool.connect()
+            const client = await pool.connect()
 
             try {
                 const {
                     userId,
                     customerid,
                     points,
+                    isactive,
+                    isvip,
+                    isblacklist,
                     privilegedmatchrule
                 } = req.body
 
-                await client.query(
-                    'BEGIN'
-                )
+                const actingUserId =
+                    Number(req.authUser?.id || userId)
+
+                const customerId =
+                    Number(customerid)
+
+                const nextPoints =
+                    Number(points)
+
+                const nextIsActive =
+                    isactive === true
+
+                const nextIsVip =
+                    isvip === true
+
+                const nextIsBlacklist =
+                    isblacklist === true
+
+                const nextPrivileged =
+                    privilegedmatchrule === true
+
+                if (
+                    !Number.isInteger(customerId) ||
+                    customerId <= 0 ||
+                    !Number.isInteger(actingUserId) ||
+                    actingUserId <= 0 ||
+                    !Number.isFinite(nextPoints) ||
+                    nextPoints < 0
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Valid customer, user and point balance are required.',
+                        code: 40000
+                    })
+                }
+
+                await client.query('BEGIN')
 
                 const customerResult =
                     await client.query(
                         `
                         SELECT
                             "Points",
+                            "IsActive",
+                            "IsVIP",
+                            "IsBlacklist",
+                            "PhoneVerified",
+                            "VerificationMethod",
                             "PrivilegedMatchRule"
-
                         FROM "Customer"
-
-                        WHERE
-                            "ID" = $1
-
+                        WHERE "ID" = $1
                         FOR UPDATE
                         `,
-                        [
-                            customerid
-                        ]
+                        [customerId]
                     )
 
-                if (
-                    customerResult.rowCount ===
-                    0
-                ) {
-                    await client.query(
-                        'ROLLBACK'
-                    )
+                if (!customerResult.rowCount) {
+                    await client.query('ROLLBACK')
 
-                    return res
-                        .status(404)
-                        .json({
-                            success: false,
-                            message:
-                                'Customer not found.',
-                            code: 404
-                        })
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Customer not found.',
+                        code: 40400
+                    })
                 }
 
                 const currentCustomer =
                     customerResult.rows[0]
 
-                const oldPoints =
-                    currentCustomer.Points
+                const changes = [
+                    {
+                        changed:
+                            Number(currentCustomer.Points) !== nextPoints,
+                        type: 'POINTS',
+                        oldValue: currentCustomer.Points,
+                        newValue: nextPoints,
+                        description:
+                            `User ${actingUserId} changed points from ${currentCustomer.Points} to ${nextPoints}`
+                    },
+                    {
+                        changed:
+                            currentCustomer.PrivilegedMatchRule !== nextPrivileged,
+                        type: 'PRIVILEGED_MATCH_RULE',
+                        oldValue: currentCustomer.PrivilegedMatchRule,
+                        newValue: nextPrivileged,
+                        description:
+                            `User ${actingUserId} ${nextPrivileged ? 'enabled' : 'disabled'} Privileged Match Rule`
+                    },
+                    {
+                        changed:
+                            currentCustomer.IsActive !== nextIsActive,
+                        type: 'ACCOUNT_STATUS',
+                        oldValue: currentCustomer.IsActive,
+                        newValue: nextIsActive,
+                        description:
+                            `User ${actingUserId} ${nextIsActive ? 'activated' : 'deactivated'} customer account`
+                    },
+                    {
+                        changed:
+                            currentCustomer.IsVIP !== nextIsVip,
+                        type: 'VIP_STATUS',
+                        oldValue: currentCustomer.IsVIP,
+                        newValue: nextIsVip,
+                        description:
+                            `User ${actingUserId} ${nextIsVip ? 'enabled' : 'disabled'} VIP status`
+                    },
+                    {
+                        changed:
+                            currentCustomer.IsBlacklist !== nextIsBlacklist,
+                        type: 'BLACKLIST_STATUS',
+                        oldValue: currentCustomer.IsBlacklist,
+                        newValue: nextIsBlacklist,
+                        description:
+                            `User ${actingUserId} ${nextIsBlacklist ? 'enabled' : 'disabled'} blacklist status`
+                    }
+                ]
 
-                const oldPrivileged =
-                    currentCustomer
-                        .PrivilegedMatchRule
-
-                // ====================================================
-                // Log points change
-                // ====================================================
-
-                if (
-                    Number(oldPoints) !==
-                    Number(points)
-                ) {
-                    await client.query(
-                        `
-                        INSERT INTO "CustomerLog"
-                        (
-                            "CustomerID",
-                            "UserID",
-                            "LogType",
-                            "OldValue",
-                            "NewValue",
-                            "Description",
-                            "DateCreated"
-                        )
-                        VALUES
-                        (
-                            $1,
-                            $2,
-                            $3,
-                            $4,
-                            $5,
-                            $6,
-                            NOW()
-                        )
-                        `,
-                        [
-                            customerid,
-                            userId,
-                            'POINTS',
-                            String(
-                                oldPoints
-                            ),
-                            String(
-                                points
-                            ),
-                            `User ${userId} changed points from ${oldPoints} to ${points}`
-                        ]
-                    )
-                }
-
-                // ====================================================
-                // Log privileged rule change
-                // ====================================================
-
-                if (
-                    oldPrivileged !==
-                    privilegedmatchrule
-                ) {
-                    const action =
-                        privilegedmatchrule
-                            ? 'enabled'
-                            : 'disabled'
+                for (const change of changes) {
+                    if (!change.changed) continue
 
                     await client.query(
                         `
@@ -1522,72 +1698,70 @@ module.exports = function (io) {
                         )
                         `,
                         [
-                            customerid,
-                            userId,
-                            'PRIVILEGED_MATCH_RULE',
-                            String(
-                                oldPrivileged
-                            ),
-                            String(
-                                privilegedmatchrule
-                            ),
-                            `User ${userId} ${action} Privileged Match Rule`
+                            customerId,
+                            actingUserId,
+                            change.type,
+                            String(change.oldValue),
+                            String(change.newValue),
+                            change.description
                         ]
                     )
                 }
 
-                // ====================================================
-                // Update customer
-                // ====================================================
+                const updateResult =
+                    await client.query(
+                        `
+                        UPDATE "Customer"
+                        SET
+                            "Points" = $1,
+                            "PrivilegedMatchRule" = $2,
+                            "IsActive" = $3,
+                            "IsVIP" = $4,
+                            "IsBlacklist" = $5
+                        WHERE "ID" = $6
+                        RETURNING
+                            "ID" AS id,
+                            "Points" AS points,
+                            "PrivilegedMatchRule" AS "PrivilegedMatchRule",
+                            "IsActive" AS isactive,
+                            "IsVIP" AS isvip,
+                            "IsBlacklist" AS isblacklist,
+                            "PhoneVerified" AS phoneverified,
+                            "VerificationMethod" AS verificationmethod
+                        `,
+                        [
+                            nextPoints,
+                            nextPrivileged,
+                            nextIsActive,
+                            nextIsVip,
+                            nextIsBlacklist,
+                            customerId
+                        ]
+                    )
 
-                await client.query(
-                    `
-                    UPDATE "Customer"
+                await client.query('COMMIT')
 
-                    SET
-                        "Points" = $1,
-                        "PrivilegedMatchRule" =
-                            $2
-
-                    WHERE
-                        "ID" = $3
-                    `,
-                    [
-                        points,
-                        privilegedmatchrule,
-                        customerid
-                    ]
-                )
-
-                await client.query(
-                    'COMMIT'
-                )
-
-                return res
-                    .status(200)
-                    .json({
-                        success: true,
-                        message:
-                            'Customer account updated successfully.',
-                        code: 20000
-                    })
+                return res.status(200).json({
+                    success: true,
+                    message: 'Customer account updated successfully.',
+                    code: 20000,
+                    data: updateResult.rows[0]
+                })
             } catch (error) {
-                await client.query(
-                    'ROLLBACK'
-                )
+                try {
+                    await client.query('ROLLBACK')
+                } catch {}
 
                 console.error(
+                    'Update customer account error:',
                     error
                 )
 
-                return res
-                    .status(500)
-                    .json({
-                        success: false,
-                        message:
-                            'Error updating customer account.',
-                        code: 500
-                    })
+                return res.status(500).json({
+                    success: false,
+                    message: 'Error updating customer account.',
+                    code: 50000
+                })
             } finally {
                 client.release()
             }

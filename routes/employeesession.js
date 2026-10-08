@@ -3,6 +3,7 @@ const router = express.Router()
 
 const { pool } = require('../db')
 const { requirePermission } = require('../middleware/auth')
+const { isAuditVerificationEnabled } = require('../utils/auditVerification')
 
 // ============================================================
 // CLOCK IN
@@ -1490,12 +1491,16 @@ router.get(
                         .localeCompare(String(b.machineNumber ?? b.machineId), undefined, { numeric: true })
                 )
 
+            const auditVerificationEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
             return res.status(200).json({
                 success: true,
                 code: 20000,
                 message: 'Session Raffle report retrieved successfully.',
                 data: {
                     session,
+                    auditVerificationEnabled,
                     summary: {
                         totalAmount,
                         winnerCount: entries.length,
@@ -1560,6 +1565,17 @@ router.put(
                     success: false,
                     code: 40100,
                     message: 'Authenticated user is required.'
+                })
+            }
+
+            const auditEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
+            if (!auditEnabled) {
+                return res.status(409).json({
+                    success: false,
+                    code: 40900,
+                    message: 'Audit Verification is not enabled for this location.'
                 })
             }
 
@@ -1966,12 +1982,16 @@ router.get(
                 }
             }
 
+            const auditVerificationEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
             return res.status(200).json({
                 success: true,
                 code: 20000,
                 message: 'Session Bonus report retrieved successfully.',
                 data: {
                     session,
+                    auditVerificationEnabled,
                     summary: {
                         totalAmount,
                         bonusCount: entries.length,
@@ -2035,6 +2055,17 @@ router.put(
                     success: false,
                     code: 40100,
                     message: 'Authenticated user is required.'
+                })
+            }
+
+            const auditEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
+            if (!auditEnabled) {
+                return res.status(409).json({
+                    success: false,
+                    code: 40900,
+                    message: 'Audit Verification is not enabled for this location.'
                 })
             }
 
@@ -2188,7 +2219,11 @@ router.get(
                         NULLIF(BTRIM(CONCAT_WS(' ', c."Firstname", c."Lastname")), ''),
                         CONCAT('Customer #', lb."CustomerId")
                     ) AS "customerName",
-                    c."avatar" AS "customerAvatar"
+                    c."avatar" AS "customerAvatar",
+                    COALESCE(lb."ReviewStatus", 'Pending') AS "reviewStatus",
+                    lb."ReviewedBy" AS "reviewedBy",
+                    lb."ReviewedAt" AS "reviewedAt",
+                    COALESCE(NULLIF(BTRIM(ru."Name"), ''), ru."Username") AS "reviewedByName"
                 FROM "LuckyBirdAwards" lb
                 JOIN "Machines" m
                   ON m."ID" = lb."MachineId"
@@ -2197,6 +2232,8 @@ router.get(
                   ON mt."ID" = m."MachineTypeId"
                 LEFT JOIN "Customer" c
                   ON c."ID" = lb."CustomerId"
+                LEFT JOIN "Users" ru
+                  ON ru."ID" = lb."ReviewedBy"
                 WHERE lb."EmployeeSessionId" = $1
                   AND lb."LocationId" = $2
                 ORDER BY lb."CreatedAt" DESC, lb."ID" DESC`,
@@ -2213,6 +2250,23 @@ router.get(
                 entries.map(item => Number(item.machineId)).filter(Boolean)
             )
 
+            const auditVerificationEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
+            const approvedCount = entries.filter(
+                item => item.reviewStatus === 'Approved'
+            ).length
+
+            const rejectedCount = entries.filter(
+                item => item.reviewStatus === 'Rejected'
+            ).length
+
+            const pendingReview = entries.filter(
+                item => !item.reviewStatus || item.reviewStatus === 'Pending'
+            ).length
+
+            const reviewedCount = approvedCount + rejectedCount
+
             let highest = null
             for (const entry of entries) {
                 if (!highest || Number(entry.amount) > Number(highest.amount)) {
@@ -2226,12 +2280,17 @@ router.get(
                 message: 'Session Lucky Bird report retrieved successfully.',
                 data: {
                     session,
+                    auditVerificationEnabled,
                     summary: {
                         totalAmount,
                         luckyBirdCount: entries.length,
                         machineCount: machineIds.size,
                         highestAmount: highest ? Number(highest.amount || 0) : 0,
-                        highestMachineNumber: highest?.machineNumber ?? null
+                        highestMachineNumber: highest?.machineNumber ?? null,
+                        reviewedCount,
+                        pendingReview,
+                        approvedCount,
+                        rejectedCount
                     },
                     entries
                 }
@@ -2248,6 +2307,117 @@ router.get(
     }
 )
 
+
+// ============================================================
+// REPORTS - REVIEW LUCKY BIRD PHOTO
+// Permission: employeesession.update
+// ============================================================
+
+router.put(
+    '/reports/lucky-bird/:luckybirdawardid/review',
+    requirePermission('employeesession.update'),
+    async (req, res) => {
+        try {
+            const luckybirdawardid = Number(req.params.luckybirdawardid)
+            const locationid = Number(req.body.locationid)
+            const status = String(req.body.status || '').trim()
+            const reviewedBy = Number(req.authUser?.id || 0)
+
+            if (!luckybirdawardid || !locationid) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message: 'Lucky Bird award and location are required.'
+                })
+            }
+
+            if (!['Approved', 'Rejected'].includes(status)) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message: 'Review status must be Approved or Rejected.'
+                })
+            }
+
+            if (!reviewedBy) {
+                return res.status(401).json({
+                    success: false,
+                    code: 40100,
+                    message: 'Authenticated user is required.'
+                })
+            }
+
+            const auditEnabled =
+                await isAuditVerificationEnabled(pool, locationid)
+
+            if (!auditEnabled) {
+                return res.status(409).json({
+                    success: false,
+                    code: 40900,
+                    message: 'Audit Verification is not enabled for this location.'
+                })
+            }
+
+            const result = await pool.query(
+                `
+                UPDATE "LuckyBirdAwards" lb
+                SET
+                    "ReviewStatus" = $1,
+                    "ReviewedBy" = $2,
+                    "ReviewedAt" = NOW()
+                WHERE
+                    lb."ID" = $3
+                    AND lb."LocationId" = $4
+                    AND NULLIF(BTRIM(COALESCE(lb."ImageUrl", '')), '') IS NOT NULL
+                RETURNING
+                    lb."ID" AS id,
+                    lb."ReviewStatus" AS "reviewStatus",
+                    lb."ReviewedBy" AS "reviewedBy",
+                    lb."ReviewedAt" AS "reviewedAt"
+                `,
+                [status, reviewedBy, luckybirdawardid, locationid]
+            )
+
+            if (!result.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message: 'Lucky Bird award with reviewable photo was not found.'
+                })
+            }
+
+            const reviewerResult = await pool.query(
+                `
+                SELECT
+                    COALESCE(NULLIF(BTRIM("Name"), ''), "Username", 'User') AS "reviewedByName"
+                FROM "Users"
+                WHERE "ID" = $1
+                LIMIT 1
+                `,
+                [reviewedBy]
+            )
+
+            return res.status(200).json({
+                success: true,
+                code: 20000,
+                message: `Lucky Bird photo ${status.toLowerCase()}.`,
+                data: {
+                    ...result.rows[0],
+                    reviewedByName:
+                        reviewerResult.rows[0]?.reviewedByName || null
+                }
+            })
+        } catch (error) {
+            console.error('Lucky Bird photo review error:', error)
+
+            return res.status(500).json({
+                success: false,
+                code: 50000,
+                message: 'Unable to update Lucky Bird photo review.'
+            })
+        }
+    }
+)
 
 // REPORTS - READ-ONLY SHIFT CASH REPORT FOR ONE EMPLOYEE SESSION
 // Uses the same cash types and America/Chicago point window as finance.
