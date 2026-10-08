@@ -134,20 +134,25 @@ const balanceQuery = `
         SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense",
                COUNT(b."ID")::integer AS "bonusCount"
         FROM s LEFT JOIN "BonusAwards" b ON b."EmployeeSessionId"=s."ID"
+    ),
+    lucky_bird_cash AS (
+        SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense",
+               COUNT(lb."ID")::integer AS "luckyBirdCount"
+        FROM s LEFT JOIN "LuckyBirdAwards" lb ON lb."EmployeeSessionId"=s."ID"
     )
     SELECT cash.opening, cash.received,
            (cash.opening + cash.received)::numeric(14,2) AS "openingBank",
            cash."cashExpenses", cash."transferOut", cash."regularExpense",
            raffle_cash."raffleExpense", ticket_cash."ticketOutExpense",
-           bonus_cash."bonusExpense",
+           bonus_cash."bonusExpense", lucky_bird_cash."luckyBirdExpense",
            cash."ownerWithdrawals", cash.opening_count,
            point_cash."matchPointExpense", point_cash."extraMatchExpense",
            point_cash."pointsExpense", point_cash."pointsCount",
-           raffle_cash."raffleCount", ticket_cash."ticketOutCount", bonus_cash."bonusCount",
-           (cash."cashExpenses" + point_cash."pointsExpense" + raffle_cash."raffleExpense" + ticket_cash."ticketOutExpense" + bonus_cash."bonusExpense")::numeric(14,2) AS expenses,
-           (cash.opening + cash.received - cash."transferOut" - cash."cashExpenses" - point_cash."pointsExpense" - raffle_cash."raffleExpense" - ticket_cash."ticketOutExpense" - bonus_cash."bonusExpense" - cash."ownerWithdrawals")::numeric(14,2) AS balance,
+           raffle_cash."raffleCount", ticket_cash."ticketOutCount", bonus_cash."bonusCount", lucky_bird_cash."luckyBirdCount",
+           (cash."cashExpenses" + point_cash."pointsExpense" + raffle_cash."raffleExpense" + ticket_cash."ticketOutExpense" + bonus_cash."bonusExpense" + lucky_bird_cash."luckyBirdExpense")::numeric(14,2) AS expenses,
+           (cash.opening + cash.received - cash."transferOut" - cash."cashExpenses" - point_cash."pointsExpense" - raffle_cash."raffleExpense" - ticket_cash."ticketOutExpense" - bonus_cash."bonusExpense" - lucky_bird_cash."luckyBirdExpense" - cash."ownerWithdrawals")::numeric(14,2) AS balance,
            cash.entry_count
-    FROM cash CROSS JOIN point_cash CROSS JOIN raffle_cash CROSS JOIN ticket_cash CROSS JOIN bonus_cash`
+    FROM cash CROSS JOIN point_cash CROSS JOIN raffle_cash CROSS JOIN ticket_cash CROSS JOIN bonus_cash CROSS JOIN lucky_bird_cash`
 
 // Point assignments display as read-only items in the ledger. They are NOT writable
 // SessionCashTransactions rows, so repeated loading cannot double-charge the customer.
@@ -216,6 +221,26 @@ const bonusLedgerQuery = `
     FROM "BonusAwards" b
     LEFT JOIN "Machines" m ON m."ID"=b."MachineId"
     WHERE b."EmployeeSessionId"=$1`
+
+const luckyBirdLedgerQuery = `
+    SELECT CONCAT('luckybird-',lb."ID") AS id,
+           'LUCKY_BIRD'::text AS type,
+           lb."Amount"::numeric(14,2) AS amount,
+           lb."CreatedAt" AS "createdAt",
+           lb."CustomerId" AS "customerId",
+           lb."MachineId" AS "machineId",
+           CONCAT(
+               COALESCE(NULLIF(BTRIM(lb."LuckyBirdName"),''),'Lucky Bird'),
+               ' · ',
+               COALESCE(NULLIF(BTRIM(lb."PayoutDescription"),''),'Payout'),
+               ' · Customer #',COALESCE(lb."CustomerId"::text,'—'),
+               ' · Machine #',COALESCE(m."MachineNumber"::text,'—')
+           ) AS notes,
+           NULL::integer AS "expenseTypeId",
+           'Lucky Bird'::text AS "expenseTypeName"
+    FROM "LuckyBirdAwards" lb
+    LEFT JOIN "Machines" m ON m."ID"=lb."MachineId"
+    WHERE lb."EmployeeSessionId"=$1`
 
 // Server-side source of truth for a completed reading-session profit.
 // Each MachineReadings row already stores PreviousIn / PreviousOut together
@@ -364,7 +389,7 @@ router.get('/current', requirePermission('clock.read'), async (req, res) => {
             [Number(req.authUser.id), locationId])
         let transactions = [], summary = null, closing = null
         if (session) {
-            const [entries, totals, closed, pointEntries, raffleEntries, ticketEntries, bonusEntries] = await Promise.all([
+            const [entries, totals, closed, pointEntries, raffleEntries, ticketEntries, bonusEntries, luckyBirdEntries] = await Promise.all([
                 pool.query(`SELECT t."ID" AS id, t."Type" AS type, t."Amount" AS amount,
                     t."Notes" AS notes, t."CreatedAt" AS "createdAt", t."ExpenseTypeId" AS "expenseTypeId",
                     t."CreditTypeId" AS "creditTypeId", t."CreatedBy" AS "createdBy",
@@ -382,9 +407,10 @@ router.get('/current', requirePermission('clock.read'), async (req, res) => {
                 pool.query(pointsLedgerQuery, [session.id]),
                 pool.query(raffleLedgerQuery, [session.id]),
                 pool.query(ticketOutLedgerQuery, [session.id]),
-                pool.query(bonusLedgerQuery, [session.id])
+                pool.query(bonusLedgerQuery, [session.id]),
+                pool.query(luckyBirdLedgerQuery, [session.id])
             ])
-            transactions = [...entries.rows, ...pointEntries.rows, ...raffleEntries.rows, ...ticketEntries.rows, ...bonusEntries.rows]
+            transactions = [...entries.rows, ...pointEntries.rows, ...raffleEntries.rows, ...ticketEntries.rows, ...bonusEntries.rows, ...luckyBirdEntries.rows]
                 .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
             summary = totals.rows[0]; closing = closed.rows[0] || null
         }
@@ -839,9 +865,9 @@ router.get('/history', requirePermission('clock.read'), async (req, res) => {
                 COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                 cash.opening, cash.received, cash."cashExpenses", cash."ownerWithdrawals",
                 points."pointsExpense", points."pointsCount",
-                raffle."raffleExpense", ticket."ticketOutExpense", bonus."bonusExpense",
-                (cash."cashExpenses" + points."pointsExpense" + raffle."raffleExpense" + ticket."ticketOutExpense" + bonus."bonusExpense")::numeric(14,2) AS expenses,
-                (cash.opening + cash.received - cash."cashExpenses" - points."pointsExpense" - raffle."raffleExpense" - ticket."ticketOutExpense" - bonus."bonusExpense" - cash."ownerWithdrawals")::numeric(14,2) AS "calculatedBalance",
+                raffle."raffleExpense", ticket."ticketOutExpense", bonus."bonusExpense", luckybird."luckyBirdExpense",
+                (cash."cashExpenses" + points."pointsExpense" + raffle."raffleExpense" + ticket."ticketOutExpense" + bonus."bonusExpense" + luckybird."luckyBirdExpense")::numeric(14,2) AS expenses,
+                (cash.opening + cash.received - cash."cashExpenses" - points."pointsExpense" - raffle."raffleExpense" - ticket."ticketOutExpense" - bonus."bonusExpense" - luckybird."luckyBirdExpense" - cash."ownerWithdrawals")::numeric(14,2) AS "calculatedBalance",
                 c."ClosingBalance" AS "closingBalance",
                 c."ActualCash" AS "actualCash",
                 c."Variance" AS variance,
@@ -874,13 +900,17 @@ router.get('/history', requirePermission('clock.read'), async (req, res) => {
                 SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense", COUNT(b."ID")::integer AS "bonusCount"
                 FROM "BonusAwards" b WHERE b."EmployeeSessionId"=es."ID"
             ) bonus ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense", COUNT(lb."ID")::integer AS "luckyBirdCount"
+                FROM "LuckyBirdAwards" lb WHERE lb."EmployeeSessionId"=es."ID"
+            ) luckybird ON TRUE
             LEFT JOIN "SessionCashClosings" c ON c."SessionId" = es."ID"
             LEFT JOIN "SessionCashHandovers" h ON h."ID" = c."HandoverId"
             LEFT JOIN "Users" to_user ON to_user."ID" = h."ToUserId"
             WHERE es."LocationId" = $1
               AND es."ClockIn" >= ${timestamptzQuickStart('$2')}
               AND ($3::boolean OR es."UserId" = $4)
-              AND (cash.entry_count > 0 OR points."pointsCount" > 0 OR raffle."raffleCount" > 0 OR ticket."ticketOutCount" > 0 OR bonus."bonusCount" > 0)
+              AND (cash.entry_count > 0 OR points."pointsCount" > 0 OR raffle."raffleCount" > 0 OR ticket."ticketOutCount" > 0 OR bonus."bonusCount" > 0 OR luckybird."luckyBirdCount" > 0)
             ORDER BY es."ClockIn" DESC
             LIMIT 300`,
             [locationId, range, isAdmin(req), Number(req.authUser.id)])
@@ -921,9 +951,9 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
                 COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                 cash.opening, cash.received, cash."cashExpenses", cash."ownerWithdrawals",
                 points."pointsExpense", points."pointsCount",
-                raffle."raffleExpense", ticket."ticketOutExpense", bonus."bonusExpense",
-                (cash."cashExpenses" + points."pointsExpense" + raffle."raffleExpense" + ticket."ticketOutExpense" + bonus."bonusExpense")::numeric(14,2) AS expenses,
-                (cash.opening + cash.received - cash."cashExpenses" - points."pointsExpense" - raffle."raffleExpense" - ticket."ticketOutExpense" - bonus."bonusExpense" - cash."ownerWithdrawals")::numeric(14,2) AS "calculatedBalance",
+                raffle."raffleExpense", ticket."ticketOutExpense", bonus."bonusExpense", luckybird."luckyBirdExpense",
+                (cash."cashExpenses" + points."pointsExpense" + raffle."raffleExpense" + ticket."ticketOutExpense" + bonus."bonusExpense" + luckybird."luckyBirdExpense")::numeric(14,2) AS expenses,
+                (cash.opening + cash.received - cash."cashExpenses" - points."pointsExpense" - raffle."raffleExpense" - ticket."ticketOutExpense" - bonus."bonusExpense" - luckybird."luckyBirdExpense" - cash."ownerWithdrawals")::numeric(14,2) AS "calculatedBalance",
                 c."ClosingBalance" AS "closingBalance",
                 c."ActualCash" AS "actualCash",
                 c."Variance" AS variance,
@@ -956,6 +986,10 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
                 SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense", COUNT(b."ID")::integer AS "bonusCount"
                 FROM "BonusAwards" b WHERE b."EmployeeSessionId"=es."ID"
             ) bonus ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense", COUNT(lb."ID")::integer AS "luckyBirdCount"
+                FROM "LuckyBirdAwards" lb WHERE lb."EmployeeSessionId"=es."ID"
+            ) luckybird ON TRUE
             LEFT JOIN "SessionCashClosings" c ON c."SessionId"=es."ID"
             LEFT JOIN "SessionCashHandovers" h ON h."ID"=c."HandoverId"
             LEFT JOIN "Users" to_user ON to_user."ID"=h."ToUserId"
@@ -963,7 +997,7 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
               AND ($2::date IS NULL OR es."ClockIn" >= ($2::date::timestamp AT TIME ZONE 'America/Chicago'))
               AND ($3::date IS NULL OR es."ClockIn" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
               AND ($4::integer IS NULL OR es."UserId"=$4)
-              AND (cash.entry_count > 0 OR points."pointsCount" > 0 OR raffle."raffleCount" > 0 OR ticket."ticketOutCount" > 0 OR bonus."bonusCount" > 0)
+              AND (cash.entry_count > 0 OR points."pointsCount" > 0 OR raffle."raffleCount" > 0 OR ticket."ticketOutCount" > 0 OR bonus."bonusCount" > 0 OR luckybird."luckyBirdCount" > 0)
             ORDER BY es."ClockIn" DESC`,
             [locationId, dates.startDate, dates.endDate, employeeId])
 
@@ -978,6 +1012,7 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
             acc.raffleExpense += Number(row.raffleExpense || 0)
             acc.ticketOutExpense += Number(row.ticketOutExpense || 0)
             acc.bonusExpense += Number(row.bonusExpense || 0)
+            acc.luckyBirdExpense += Number(row.luckyBirdExpense || 0)
             acc.expenses += Number(row.expenses || 0)
             if (row.closingBalance != null) acc.expectedClosing += Number(row.closingBalance || 0)
             if (row.actualCash != null) acc.actualCash += Number(row.actualCash || 0)
@@ -988,7 +1023,7 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
             return acc
         }, {
             sessionCount: 0, opening: 0, received: 0, cashExpenses: 0, ownerWithdrawals: 0,
-            pointsExpense: 0, raffleExpense: 0, ticketOutExpense: 0, bonusExpense: 0, expenses: 0, expectedClosing: 0, actualCash: 0,
+            pointsExpense: 0, raffleExpense: 0, ticketOutExpense: 0, bonusExpense: 0, luckyBirdExpense: 0, expenses: 0, expectedClosing: 0, actualCash: 0,
             variance: 0, short: 0, over: 0
         })
 
@@ -1809,6 +1844,12 @@ router.get('/admin/overview', requirePermission('clock.read'), async (req, res) 
                 WHERE b."LocationId"=$1
                   AND b."CreatedAt" >= NOW() - ($2::integer * interval '1 day')
             ),
+            lucky_bird_expenses AS (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS amount
+                FROM "LuckyBirdAwards" lb
+                WHERE lb."LocationId"=$1
+                  AND lb."CreatedAt" >= NOW() - ($2::integer * interval '1 day')
+            ),
             closings AS (
                 SELECT
                     COALESCE(SUM(c."ClosingBalance"),0)::numeric(14,2) AS "expectedClosing",
@@ -1820,7 +1861,7 @@ router.get('/admin/overview', requirePermission('clock.read'), async (req, res) 
                 WHERE c."LocationId"=$1
                   AND c."ClosedAt" >= NOW() - ($2::integer * interval '1 day')
             )
-            SELECT funding.*, (manual_expenses.amount + raffle_expenses.amount + ticket_expenses.amount + bonus_expenses.amount + COALESCE((SELECT -SUM(e."Amount") FROM "LocationCashEntries" e
+            SELECT funding.*, (manual_expenses.amount + raffle_expenses.amount + ticket_expenses.amount + bonus_expenses.amount + lucky_bird_expenses.amount + COALESCE((SELECT -SUM(e."Amount") FROM "LocationCashEntries" e
                  WHERE e."LocationId"=$1 AND e."Kind"='DIRECT_EXPENSE'
                  AND e."CreatedAt" >= NOW() - ($2::integer * interval '1 day')),0))::numeric(14,2) AS "cashExpenses",
                    owner_withdrawals.amount AS "ownerWithdrawals",
@@ -1828,9 +1869,10 @@ router.get('/admin/overview', requirePermission('clock.read'), async (req, res) 
                    raffle_expenses.amount AS "raffleExpense",
                    ticket_expenses.amount AS "ticketOutExpense",
                    bonus_expenses.amount AS "bonusExpense",
+                   lucky_bird_expenses.amount AS "luckyBirdExpense",
                    closings."expectedClosing", closings."actualClosing",
                    closings.variance, closings.short, closings.over
-            FROM funding, manual_expenses, owner_withdrawals, point_expenses, raffle_expenses, ticket_expenses, bonus_expenses, closings`,
+            FROM funding, manual_expenses, owner_withdrawals, point_expenses, raffle_expenses, ticket_expenses, bonus_expenses, lucky_bird_expenses, closings`,
             [locationId, days])
 
         const trail = await pool.query(`
@@ -2287,6 +2329,20 @@ router.get('/admin/trail/report', requirePermission('clock.read'), async (req, r
                   AND ($4::integer IS NULL OR b."EmployeeId"=$4)
 
                 UNION ALL
+                SELECT ('luckybird-' || lb."ID")::text, lb."CreatedAt", 'LUCKY_BIRD'::text,
+                    lb."Amount"::numeric(14,2), 'Posted'::text, lb."EmployeeSessionId", lb."EmployeeId",
+                    COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee'),
+                    NULL::text, NULL::text,
+                    (COALESCE(NULLIF(BTRIM(lb."LuckyBirdName"),''),'Lucky Bird') || ' · Customer #' || COALESCE(lb."CustomerId"::text,'—'))::text,
+                    NULL::numeric(14,2)
+                FROM "LuckyBirdAwards" lb
+                JOIN "Users" u ON u."ID"=lb."EmployeeId"
+                WHERE lb."LocationId"=$1
+                  AND ($2::date IS NULL OR lb."CreatedAt" >= ($2::date::timestamp AT TIME ZONE 'America/Chicago'))
+                  AND ($3::date IS NULL OR lb."CreatedAt" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
+                  AND ($4::integer IS NULL OR lb."EmployeeId"=$4)
+
+                UNION ALL
 
                 SELECT ('handover-' || h."ID")::text, h."CreatedAt",
                     'EMPLOYEE_HANDOVER'::text, h."Amount"::numeric(14,2), h."Status"::text,
@@ -2385,6 +2441,14 @@ router.get('/admin/trail/report', requirePermission('clock.read'), async (req, r
                   AND ($3::date IS NULL OR b."CreatedAt" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
                   AND ($4::integer IS NULL OR b."EmployeeId"=$4)
             ),
+            lucky_bird_expenses AS (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS amount
+                FROM "LuckyBirdAwards" lb
+                WHERE lb."LocationId"=$1
+                  AND ($2::date IS NULL OR lb."CreatedAt" >= ($2::date::timestamp AT TIME ZONE 'America/Chicago'))
+                  AND ($3::date IS NULL OR lb."CreatedAt" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
+                  AND ($4::integer IS NULL OR lb."EmployeeId"=$4)
+            ),
             closings AS (
                 SELECT
                     COALESCE(SUM(c."ClosingBalance"),0)::numeric(14,2) AS "expectedClosing",
@@ -2399,7 +2463,7 @@ router.get('/admin/trail/report', requirePermission('clock.read'), async (req, r
                   AND ($3::date IS NULL OR c."ClosedAt" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
                   AND ($4::integer IS NULL OR es."UserId"=$4)
             )
-            SELECT funding.*, (manual_expenses.amount + raffle_expenses.amount + ticket_expenses.amount + bonus_expenses.amount + COALESCE((SELECT -SUM(e."Amount") FROM "LocationCashEntries" e
+            SELECT funding.*, (manual_expenses.amount + raffle_expenses.amount + ticket_expenses.amount + bonus_expenses.amount + lucky_bird_expenses.amount + COALESCE((SELECT -SUM(e."Amount") FROM "LocationCashEntries" e
                 WHERE e."LocationId"=$1 AND e."Kind"='DIRECT_EXPENSE'
                   AND ($2::date IS NULL OR e."CreatedAt" >= ($2::date::timestamp AT TIME ZONE 'America/Chicago'))
                   AND ($3::date IS NULL OR e."CreatedAt" < (($3::date + 1)::timestamp AT TIME ZONE 'America/Chicago'))
@@ -2409,9 +2473,10 @@ router.get('/admin/trail/report', requirePermission('clock.read'), async (req, r
                    raffle_expenses.amount AS "raffleExpense",
                    ticket_expenses.amount AS "ticketOutExpense",
                    bonus_expenses.amount AS "bonusExpense",
+                   lucky_bird_expenses.amount AS "luckyBirdExpense",
                    closings."expectedClosing", closings."actualClosing",
                    closings.variance, closings.short, closings.over
-            FROM funding, manual_expenses, owner_withdrawals, point_expenses, raffle_expenses, ticket_expenses, bonus_expenses, closings`,
+            FROM funding, manual_expenses, owner_withdrawals, point_expenses, raffle_expenses, ticket_expenses, bonus_expenses, lucky_bird_expenses, closings`,
             [locationId, dates.startDate, dates.endDate, employeeId])
 
         const readingProfitTrail = await pool.query(`

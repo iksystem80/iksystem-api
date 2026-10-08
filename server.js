@@ -79,6 +79,9 @@ const employeeFinanceRoutes = require('./routes/employeeFinance')
 const locationCashRoutes = require('./routes/locationCash')
 const raffleRoutes = require('./routes/raffle')
 const ticketOutRoutes = require('./routes/ticketOut')
+const customerVerificationRoutes = require('./routes/customerVerification')
+const luckyBirdRoutes = require('./routes/luckybird')
+
 
 const { startPromotionWorker } = require('./services/promotionWorker')
 // ============================================
@@ -104,7 +107,8 @@ app.use('/api/employeefinance', employeeFinanceRoutes)
 app.use('/api/locationcash', locationCashRoutes)
 app.use('/api/raffle', raffleRoutes)
 app.use('/api/ticketout', ticketOutRoutes)
-        
+app.use('/api/customerverification', customerVerificationRoutes)
+app.use('/api/luckybird', luckyBirdRoutes)
 
 /*
  * Start once after database/app initialization.

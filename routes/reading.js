@@ -2104,6 +2104,13 @@ router.get(
                            SUM(COALESCE(ba."Amount",0))::numeric(14,2) AS amount
                     FROM "BonusAwards" ba
                     INNER JOIN covered c ON c."ID"=ba."EmployeeSessionId"
+
+                    UNION ALL
+
+                    SELECT 'Lucky Bird' AS category,
+                           SUM(COALESCE(lb."Amount",0))::numeric(14,2) AS amount
+                    FROM "LuckyBirdAwards" lb
+                    INNER JOIN covered c ON c."ID"=lb."EmployeeSessionId"
                 )
                 SELECT category, SUM(COALESCE(amount,0))::numeric(14,2) AS amount
                 FROM expense_rows
@@ -2157,7 +2164,7 @@ router.get(
                         ) AS details
                     FROM (
                         -- Same expense sources used by Employee Transactions / balanceQuery:
-                        -- manual EXPENSE + Match/Extra Match + Raffle + Ticket Out + Bonus.
+                        -- manual EXPENSE + Match/Extra Match + Raffle + Ticket Out + Bonus + Lucky Bird.
                         SELECT
                             'EXPENSE'::text AS type,
                             COALESCE(NULLIF(BTRIM(et."Name"),''),'Expense')::text AS category,
@@ -2241,6 +2248,23 @@ router.get(
                         FROM "BonusAwards" b
                         LEFT JOIN "Machines" m_b ON m_b."ID"=b."MachineId"
                         WHERE b."EmployeeSessionId"=es."ID"
+
+                        UNION ALL
+
+                        SELECT
+                            'LUCKY_BIRD'::text AS type,
+                            'Lucky Bird'::text AS category,
+                            COALESCE(lb."Amount",0)::numeric(14,2) AS amount,
+                            (COALESCE(NULLIF(BTRIM(lb."LuckyBirdName"),''),'Lucky Bird') ||
+                             ' · ' || COALESCE(NULLIF(BTRIM(lb."PayoutDescription"),''),'Payout') ||
+                             ' · Customer #' || COALESCE(lb."CustomerId"::text,'—') ||
+                             ' · Machine #' || COALESCE(m_lb."MachineNumber"::text,'—'))::text AS details,
+                            lb."CreatedAt" AS created_at,
+                            6 AS sort_group,
+                            lb."ID"::bigint AS sort_id
+                        FROM "LuckyBirdAwards" lb
+                        LEFT JOIN "Machines" m_lb ON m_lb."ID"=lb."MachineId"
+                        WHERE lb."EmployeeSessionId"=es."ID"
                     ) x
                 ) expense ON TRUE
                 WHERE es."ReadingSessionId"=$1
@@ -2636,10 +2660,11 @@ router.get(
             )
             const raffleGivenAmount = expenseAmountBy(category => category === 'RAFFLE')
             const bonusGivenAmount = expenseAmountBy(category => category === 'BONUS')
+            const luckyBirdGivenAmount = expenseAmountBy(category => category === 'LUCKY BIRD')
             const payrollAmount = expenseAmountBy(category => category.includes('PAYROLL'))
             const allOtherExpenseAmount = Math.max(
                 0,
-                allExpenses - matchPointGivenAmount - raffleGivenAmount - bonusGivenAmount - payrollAmount
+                allExpenses - matchPointGivenAmount - raffleGivenAmount - bonusGivenAmount - luckyBirdGivenAmount - payrollAmount
             )
 
             const percentageOfReadingIn = amount =>
@@ -2682,6 +2707,10 @@ router.get(
                     bonusGiven: {
                         amount: bonusGivenAmount,
                         percentage: percentageOfReadingIn(bonusGivenAmount)
+                    },
+                    luckyBirdGiven: {
+                        amount: luckyBirdGivenAmount,
+                        percentage: percentageOfReadingIn(luckyBirdGivenAmount)
                     },
                     payroll: {
                         amount: payrollAmount,

@@ -230,6 +230,8 @@ router.post(
                  SELECT 1 FROM "TicketOuts" t WHERE t."EmployeeSessionId" = $1
                  UNION ALL
                  SELECT 1 FROM "BonusAwards" b WHERE b."EmployeeSessionId" = $1
+                 UNION ALL
+                 SELECT 1 FROM "LuckyBirdAwards" lb WHERE lb."EmployeeSessionId" = $1
                  LIMIT 1`,
                 [sessionId]
             )
@@ -600,7 +602,8 @@ router.get('/reports/employees', requirePermission('employeesession.read'), asyn
                        COALESCE(c.cash_expenses, 0) AS cash_expenses,
                        COALESCE(r.raffle_expenses, 0) AS raffle_expenses,
                        COALESCE(tk.ticket_expenses, 0) AS ticket_expenses,
-                       COALESCE(bn.bonus_expenses, 0) AS bonus_expenses
+                       COALESCE(bn.bonus_expenses, 0) AS bonus_expenses,
+                       COALESCE(lb.lucky_bird_expenses, 0) AS lucky_bird_expenses
                 FROM selected_sessions es
                 LEFT JOIN LATERAL (
                     SELECT COALESCE(SUM(cm."Points"),0) AS points
@@ -624,6 +627,10 @@ router.get('/reports/employees', requirePermission('employeesession.read'), asyn
                     SELECT COALESCE(SUM(b."Amount"),0) AS bonus_expenses
                     FROM "BonusAwards" b WHERE b."EmployeeSessionId"=es."ID"
                 ) bn ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(lb."Amount"),0) AS lucky_bird_expenses
+                    FROM "LuckyBirdAwards" lb WHERE lb."EmployeeSessionId"=es."ID"
+                ) lb ON true
             )
             SELECT u."ID" AS "userId",
                    COALESCE(NULLIF(BTRIM(u."Name"), ''), u."Username", 'Employee') AS "name",
@@ -638,7 +645,8 @@ router.get('/reports/employees', requirePermission('employeesession.read'), asyn
                    COALESCE(SUM(s.raffle_expenses),0)::double precision AS "raffleExpenses",
                    COALESCE(SUM(s.ticket_expenses),0)::double precision AS "ticketOutExpenses",
                    COALESCE(SUM(s.bonus_expenses),0)::double precision AS "bonusExpenses",
-                   COALESCE(SUM(s.cash_expenses + s.raffle_expenses + s.ticket_expenses + s.bonus_expenses),0)::double precision AS "totalExpenses"
+                   COALESCE(SUM(s.lucky_bird_expenses),0)::double precision AS "luckyBirdExpenses",
+                   COALESCE(SUM(s.cash_expenses + s.raffle_expenses + s.ticket_expenses + s.bonus_expenses + s.lucky_bird_expenses),0)::double precision AS "totalExpenses"
             FROM "Users" u JOIN session_totals s ON s."UserId" = u."ID"
             WHERE u."LocationId" = $1 AND COALESCE(u."IsActive",true) = true
             GROUP BY u."ID", u."Name", u."Username", u."Avatar", u."JobTitle"
@@ -718,7 +726,8 @@ router.get(
                     COALESCE(r.raffle_expenses,0)::double precision AS "raffleExpenses",
                     COALESCE(tk.ticket_expenses,0)::double precision AS "ticketOutExpenses",
                     COALESCE(bn.bonus_expenses,0)::double precision AS "bonusExpenses",
-                    (COALESCE(c.cash_expenses,0)+COALESCE(r.raffle_expenses,0)+COALESCE(tk.ticket_expenses,0)+COALESCE(bn.bonus_expenses,0))::double precision AS "totalExpenses",
+                    COALESCE(lb.lucky_bird_expenses,0)::double precision AS "luckyBirdExpenses",
+                    (COALESCE(c.cash_expenses,0)+COALESCE(r.raffle_expenses,0)+COALESCE(tk.ticket_expenses,0)+COALESCE(bn.bonus_expenses,0)+COALESCE(lb.lucky_bird_expenses,0))::double precision AS "totalExpenses",
 
                     COUNT(cm."ID") FILTER (
                         WHERE NULLIF(BTRIM(COALESCE(cm."ImageUrl", '')), '') IS NOT NULL
@@ -761,6 +770,10 @@ router.get(
                     SELECT COALESCE(SUM(b."Amount"),0) AS bonus_expenses
                     FROM "BonusAwards" b WHERE b."EmployeeSessionId"=es."ID"
                 ) bn ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(lb."Amount"),0) AS lucky_bird_expenses
+                    FROM "LuckyBirdAwards" lb WHERE lb."EmployeeSessionId"=es."ID"
+                ) lb ON true
                 WHERE
                     es."UserId" = $1
                     AND es."LocationId" = $2
@@ -772,7 +785,7 @@ router.get(
                     es."ClockOut",
                     es."TotalWorkingHours",
                     es."IsPaid",
-                    es."ReadingSessionId", c.cash_expenses, r.raffle_expenses, tk.ticket_expenses, bn.bonus_expenses
+                    es."ReadingSessionId", c.cash_expenses, r.raffle_expenses, tk.ticket_expenses, bn.bonus_expenses, lb.lucky_bird_expenses
                 ORDER BY es."ClockIn" DESC
                 `,
                 [userid, locationid, dates.startDate, dates.endDate]
@@ -872,7 +885,19 @@ router.get(
                         FROM "BonusAwards" b
                         WHERE b."EmployeeSessionId" = es."ID"
                           AND b."LocationId" = es."LocationId"
-                    ) AS "bonusTotal"
+                    ) AS "bonusTotal",
+                    (
+                        SELECT COUNT(*)::integer
+                        FROM "LuckyBirdAwards" lb
+                        WHERE lb."EmployeeSessionId" = es."ID"
+                          AND lb."LocationId" = es."LocationId"
+                    ) AS "luckyBirdEntries",
+                    (
+                        SELECT COALESCE(SUM(lb."Amount"), 0)::numeric(14,2)
+                        FROM "LuckyBirdAwards" lb
+                        WHERE lb."EmployeeSessionId" = es."ID"
+                          AND lb."LocationId" = es."LocationId"
+                    ) AS "luckyBirdTotal"
                 FROM "EmployeeSession" es
                 INNER JOIN "Users" u
                     ON u."ID" = es."UserId"
@@ -2075,6 +2100,155 @@ router.put(
 
 
 // ============================================================
+// ============================================================
+// REPORTS - LUCKY BIRD REPORT FOR ONE SESSION
+// Permission: employeesession.read
+// LuckyBirdAwards is the source of truth and is linked by EmployeeSessionId.
+// ============================================================
+
+router.get(
+    '/reports/session/:sessionid/lucky-bird',
+    requirePermission('employeesession.read'),
+    async (req, res) => {
+        const sessionid = Number(req.params.sessionid)
+        const locationid = Number(req.query.locationid)
+
+        if (!Number.isSafeInteger(sessionid) || sessionid <= 0 ||
+            !Number.isSafeInteger(locationid) || locationid <= 0) {
+            return res.status(400).json({
+                success: false,
+                code: 40000,
+                message: 'Valid session and location are required.'
+            })
+        }
+
+        try {
+            const sessionResult = await pool.query(`
+                SELECT
+                    es."ID" AS id,
+                    es."UserId" AS "userId",
+                    es."LocationId" AS "locationId",
+                    es."ClockIn" AS "clockIn",
+                    es."ClockOut" AS "clockOut",
+                    es."TotalWorkingHours" AS "totalWorkingHours",
+                    es."IsPaid" AS "isPaid",
+                    COALESCE(NULLIF(BTRIM(u."Name"), ''), u."Username", 'Employee') AS "employeeName",
+                    u."Avatar" AS "employeeAvatar",
+                    u."JobTitle" AS "jobTitle",
+                    l."CompanyId" AS "companyId"
+                FROM "EmployeeSession" es
+                JOIN "Users" u ON u."ID" = es."UserId"
+                JOIN "Locations" l ON l."ID" = es."LocationId"
+                WHERE es."ID" = $1
+                  AND es."LocationId" = $2
+                LIMIT 1`,
+                [sessionid, locationid]
+            )
+
+            const session = sessionResult.rows[0]
+
+            if (!session) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message: 'Session not found.'
+                })
+            }
+
+            const auth = req.authUser || {}
+            const role = String(auth.roleName || '').trim().toLowerCase()
+            const admin = ['owner', 'admin', 'system admin'].includes(role)
+
+            if (!auth.id ||
+                (role !== 'system admin' && Number(auth.companyId) !== Number(session.companyId)) ||
+                (!admin && (Number(auth.id) !== Number(session.userId) ||
+                    Number(auth.locationId) !== locationid))) {
+                return res.status(403).json({
+                    success: false,
+                    code: 40300,
+                    message: 'Session access denied.'
+                })
+            }
+
+            delete session.companyId
+
+            const entriesResult = await pool.query(`
+                SELECT
+                    lb."ID" AS id,
+                    lb."Amount"::numeric(14,2) AS amount,
+                    lb."ImageUrl" AS "imageUrl",
+                    lb."CreatedAt" AS "createdAt",
+                    lb."CustomerId" AS "customerId",
+                    lb."MachineId" AS "machineId",
+                    lb."LuckyBirdName" AS "luckyBirdName",
+                    lb."PayoutDescription" AS "payoutDescription",
+                    m."MachineNumber" AS "machineNumber",
+                    COALESCE(NULLIF(BTRIM(mt."TypeName"), ''), 'Unknown Game') AS game,
+                    COALESCE(
+                        NULLIF(BTRIM(CONCAT_WS(' ', c."Firstname", c."Lastname")), ''),
+                        CONCAT('Customer #', lb."CustomerId")
+                    ) AS "customerName",
+                    c."avatar" AS "customerAvatar"
+                FROM "LuckyBirdAwards" lb
+                JOIN "Machines" m
+                  ON m."ID" = lb."MachineId"
+                 AND m.locationid = lb."LocationId"
+                LEFT JOIN "MachineTypes" mt
+                  ON mt."ID" = m."MachineTypeId"
+                LEFT JOIN "Customer" c
+                  ON c."ID" = lb."CustomerId"
+                WHERE lb."EmployeeSessionId" = $1
+                  AND lb."LocationId" = $2
+                ORDER BY lb."CreatedAt" DESC, lb."ID" DESC`,
+                [sessionid, locationid]
+            )
+
+            const entries = entriesResult.rows
+            const totalAmount = entries.reduce(
+                (sum, item) => sum + Number(item.amount || 0),
+                0
+            )
+
+            const machineIds = new Set(
+                entries.map(item => Number(item.machineId)).filter(Boolean)
+            )
+
+            let highest = null
+            for (const entry of entries) {
+                if (!highest || Number(entry.amount) > Number(highest.amount)) {
+                    highest = entry
+                }
+            }
+
+            return res.status(200).json({
+                success: true,
+                code: 20000,
+                message: 'Session Lucky Bird report retrieved successfully.',
+                data: {
+                    session,
+                    summary: {
+                        totalAmount,
+                        luckyBirdCount: entries.length,
+                        machineCount: machineIds.size,
+                        highestAmount: highest ? Number(highest.amount || 0) : 0,
+                        highestMachineNumber: highest?.machineNumber ?? null
+                    },
+                    entries
+                }
+            })
+        } catch (error) {
+            console.error('Session Lucky Bird report error:', error)
+
+            return res.status(500).json({
+                success: false,
+                code: 50000,
+                message: 'Unable to retrieve Lucky Bird report.'
+            })
+        }
+    }
+)
+
+
 // REPORTS - READ-ONLY SHIFT CASH REPORT FOR ONE EMPLOYEE SESSION
 // Uses the same cash types and America/Chicago point window as finance.
 // No money is written, posted, transferred or recalculated in finance tables.
@@ -2150,6 +2324,10 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
                 SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense"
                 FROM "BonusAwards" b
                 WHERE b."EmployeeSessionId"=$1
+            ), lucky_bird_cash AS (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense"
+                FROM "LuckyBirdAwards" lb
+                WHERE lb."EmployeeSessionId"=$1
             )
             SELECT
                 cash.opening,
@@ -2166,12 +2344,14 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
                 raffle_cash."raffleExpense",
                 ticket_cash."ticketOutExpense",
                 bonus_cash."bonusExpense",
+                lucky_bird_cash."luckyBirdExpense",
                 (
                     cash."cashExpenses"
                     + point_cash."pointsExpense"
                     + raffle_cash."raffleExpense"
                     + ticket_cash."ticketOutExpense"
                     + bonus_cash."bonusExpense"
+                    + lucky_bird_cash."luckyBirdExpense"
                 )::numeric(14,2) AS expenses,
                 (
                     cash.opening
@@ -2182,6 +2362,7 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
                     - raffle_cash."raffleExpense"
                     - ticket_cash."ticketOutExpense"
                     - bonus_cash."bonusExpense"
+                    - lucky_bird_cash."luckyBirdExpense"
                     - cash."ownerWithdrawals"
                 )::numeric(14,2) AS balance,
                 cash.entry_count
@@ -2189,7 +2370,8 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
             CROSS JOIN point_cash
             CROSS JOIN raffle_cash
             CROSS JOIN ticket_cash
-            CROSS JOIN bonus_cash`, [sessionid])
+            CROSS JOIN bonus_cash
+            CROSS JOIN lucky_bird_cash`, [sessionid])
 
         const cash = await client.query(`
             SELECT t."ID" AS id, t."Type" AS type, t."Amount"::numeric(14,2) AS amount,
@@ -2260,6 +2442,16 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
             WHERE b."EmployeeSessionId"=$1
             ORDER BY b."CreatedAt",b."ID"`, [sessionid])
 
+        const luckyBirds = await client.query(`
+            SELECT lb."ID" AS id, lb."Amount"::numeric(14,2) AS amount,
+                   lb."CreatedAt" AS "eventAt", lb."CustomerId" AS "customerId",
+                   lb."MachineId" AS "machineId", m."MachineNumber" AS "machineNumber",
+                   lb."LuckyBirdName" AS "luckyBirdName", lb."PayoutDescription" AS "payoutDescription"
+            FROM "LuckyBirdAwards" lb
+            LEFT JOIN "Machines" m ON m."ID"=lb."MachineId"
+            WHERE lb."EmployeeSessionId"=$1
+            ORDER BY lb."CreatedAt",lb."ID"`, [sessionid])
+
         const closingResult = await client.query(`
             SELECT c."ClosingBalance" AS "closingBalance", c."ActualCash" AS "actualCash",
                    c."Variance" AS variance, c."ClosedAt" AS "closedAt", c."HandoverId" AS "handoverId",
@@ -2314,6 +2506,18 @@ router.get('/reports/session/:sessionid/shift', requirePermission('employeesessi
                 signedAmount: -Number(row.amount),
                 notes: [
                     row.bonusName || `Bonus #${row.id}`,
+                    row.payoutDescription || null,
+                    row.machineNumber ? `Machine #${row.machineNumber}` : null
+                ].filter(Boolean).join(' · ')
+            })),
+            ...luckyBirds.rows.map(row => ({
+                ...row,
+                kind: 'LUCKY_BIRD',
+                type: 'LUCKY_BIRD',
+                expenseTypeName: 'Lucky Bird',
+                signedAmount: -Number(row.amount),
+                notes: [
+                    row.luckyBirdName || `Lucky Bird #${row.id}`,
                     row.payoutDescription || null,
                     row.machineNumber ? `Machine #${row.machineNumber}` : null
                 ].filter(Boolean).join(' · ')

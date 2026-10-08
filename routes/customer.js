@@ -67,7 +67,6 @@ module.exports = function (io) {
         async (req, res) => {
             try {
                 const { customer } = req.body
-                const imageFile = req.file
 
                 const mycustomer =
                     JSON.parse(customer)
@@ -105,6 +104,9 @@ module.exports = function (io) {
                             "DateCreated",
                             "locationid",
                             "IsActive",
+                            "PhoneVerified",
+                            "PhoneVerifiedAt",
+                            "VerificationMethod",
                             "Embedding",
                             "CreatedBy",
                             "IsVIP",
@@ -119,12 +121,21 @@ module.exports = function (io) {
                             $5,
                             NOW(),
                             $6,
+                            false,
+                            false,
+                            NULL,
+                            NULL,
                             $7,
                             $8,
-                            $9,
                             false,
                             false
                         )
+                        RETURNING
+                            "ID" AS id,
+                            "Phone" AS phone,
+                            "IsActive" AS isactive,
+                            "PhoneVerified" AS phoneverified,
+                            "VerificationMethod" AS verificationmethod
                         `,
                         [
                             mycustomer.firstname,
@@ -133,7 +144,6 @@ module.exports = function (io) {
                             result.secure_url,
                             mycustomer.phone,
                             mycustomer.locationid,
-                            mycustomer.isactive,
                             pgvector.toSql(embedding),
                             mycustomer.createdby,
                         ]
@@ -150,8 +160,9 @@ module.exports = function (io) {
                     return res.status(201).json({
                         success: true,
                         message:
-                            'Customer saved successful!',
+                            'Customer saved. Phone verification is required before activation.',
                         code: 20000,
+                        data: dbResult.rows[0],
                     })
                 }
             } catch (error) {
@@ -259,6 +270,9 @@ module.exports = function (io) {
                                 'DD/MM/YYYY'
                             ) AS datecreated,
                             c."IsActive" AS isactive,
+                            c."PhoneVerified" AS phoneverified,
+                            c."PhoneVerifiedAt" AS phoneverifiedat,
+                            c."VerificationMethod" AS verificationmethod,
                             c."IsVIP" AS isvip,
                             c."IsBlacklist" AS isblacklist,
                             c."PrivilegedMatchRule"
@@ -273,6 +287,11 @@ module.exports = function (io) {
 
                         WHERE
                             c."locationid" = $1
+
+                        ORDER BY
+                            LOWER(c."Firstname") ASC,
+                            LOWER(c."Lastname") ASC,
+                            c."ID" ASC
                         `,
                         [
                             locationid
@@ -353,6 +372,9 @@ module.exports = function (io) {
                                 'DD/MM/YYYY'
                             ) AS datecreated,
                             c."IsActive" AS isactive,
+                            c."PhoneVerified" AS phoneverified,
+                            c."PhoneVerifiedAt" AS phoneverifiedat,
+                            c."VerificationMethod" AS verificationmethod,
                             c."IsVIP" AS isvip,
                             c."IsBlacklist" AS isblacklist,
                             c."PrivilegedMatchRule"
@@ -462,6 +484,8 @@ module.exports = function (io) {
     // ============================================================
     // UPDATE STATUS
     // Permission: customers.update
+    // An unverified customer cannot be manually activated here.
+    // Activation requires OTP verification or authorized bypass.
     // ============================================================
 
     router.put(
@@ -469,38 +493,65 @@ module.exports = function (io) {
         requirePermission('customers.update'),
         async (req, res) => {
             try {
-                const {
-                    id
-                } = req.query
+                const { id } = req.query
+
+                const customerResult =
+                    await pool.query(
+                        `
+                        SELECT
+                            "ID",
+                            "IsActive",
+                            "PhoneVerified",
+                            "VerificationMethod"
+                        FROM "Customer"
+                        WHERE "ID" = $1
+                        `,
+                        [id]
+                    )
+
+                if (customerResult.rows.length === 0) {
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Customer not found.',
+                        code: 40400,
+                    })
+                }
+
+                const customer = customerResult.rows[0]
+
+                if (
+                    customer.IsActive === false &&
+                    customer.PhoneVerified !== true &&
+                    customer.VerificationMethod !== 'Bypass'
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        message:
+                            'Phone verification or authorized bypass is required before activation.',
+                        code: 40300,
+                    })
+                }
 
                 const result =
                     await pool.query(
                         `
                         UPDATE "Customer"
-
                         SET
                             "IsActive" =
                                 NOT "IsActive"
-
-                        WHERE
-                            "ID" = $1
-
+                        WHERE "ID" = $1
                         RETURNING
                             "ID",
                             "IsActive"
                         `,
-                        [
-                            id
-                        ]
+                        [id]
                     )
 
                 return res.status(200).json({
                     success: true,
-                    message:
-                        'Update successful!',
+                    message: 'Update successful!',
                     code: 20000,
-                    data:
-                        result.rows
+                    data: result.rows
                 })
             } catch (error) {
                 console.error(
@@ -1311,6 +1362,654 @@ module.exports = function (io) {
                 return res.status(500).json({ success: false, message: 'Error while saving Extra Match.', code: 50000 })
             } finally {
                 client.release()
+            }
+        }
+    )
+
+
+
+    // ============================================================
+    // UPDATE CUSTOMER ACCOUNT
+    // Permission: customers.update
+    // ============================================================
+
+    router.put(
+        '/updatecustomeraccount',
+        requirePermission('customers.update'),
+        async (req, res) => {
+            const client =
+                await pool.connect()
+
+            try {
+                const {
+                    userId,
+                    customerid,
+                    points,
+                    privilegedmatchrule
+                } = req.body
+
+                await client.query(
+                    'BEGIN'
+                )
+
+                const customerResult =
+                    await client.query(
+                        `
+                        SELECT
+                            "Points",
+                            "PrivilegedMatchRule"
+
+                        FROM "Customer"
+
+                        WHERE
+                            "ID" = $1
+
+                        FOR UPDATE
+                        `,
+                        [
+                            customerid
+                        ]
+                    )
+
+                if (
+                    customerResult.rowCount ===
+                    0
+                ) {
+                    await client.query(
+                        'ROLLBACK'
+                    )
+
+                    return res
+                        .status(404)
+                        .json({
+                            success: false,
+                            message:
+                                'Customer not found.',
+                            code: 404
+                        })
+                }
+
+                const currentCustomer =
+                    customerResult.rows[0]
+
+                const oldPoints =
+                    currentCustomer.Points
+
+                const oldPrivileged =
+                    currentCustomer
+                        .PrivilegedMatchRule
+
+                // ====================================================
+                // Log points change
+                // ====================================================
+
+                if (
+                    Number(oldPoints) !==
+                    Number(points)
+                ) {
+                    await client.query(
+                        `
+                        INSERT INTO "CustomerLog"
+                        (
+                            "CustomerID",
+                            "UserID",
+                            "LogType",
+                            "OldValue",
+                            "NewValue",
+                            "Description",
+                            "DateCreated"
+                        )
+                        VALUES
+                        (
+                            $1,
+                            $2,
+                            $3,
+                            $4,
+                            $5,
+                            $6,
+                            NOW()
+                        )
+                        `,
+                        [
+                            customerid,
+                            userId,
+                            'POINTS',
+                            String(
+                                oldPoints
+                            ),
+                            String(
+                                points
+                            ),
+                            `User ${userId} changed points from ${oldPoints} to ${points}`
+                        ]
+                    )
+                }
+
+                // ====================================================
+                // Log privileged rule change
+                // ====================================================
+
+                if (
+                    oldPrivileged !==
+                    privilegedmatchrule
+                ) {
+                    const action =
+                        privilegedmatchrule
+                            ? 'enabled'
+                            : 'disabled'
+
+                    await client.query(
+                        `
+                        INSERT INTO "CustomerLog"
+                        (
+                            "CustomerID",
+                            "UserID",
+                            "LogType",
+                            "OldValue",
+                            "NewValue",
+                            "Description",
+                            "DateCreated"
+                        )
+                        VALUES
+                        (
+                            $1,
+                            $2,
+                            $3,
+                            $4,
+                            $5,
+                            $6,
+                            NOW()
+                        )
+                        `,
+                        [
+                            customerid,
+                            userId,
+                            'PRIVILEGED_MATCH_RULE',
+                            String(
+                                oldPrivileged
+                            ),
+                            String(
+                                privilegedmatchrule
+                            ),
+                            `User ${userId} ${action} Privileged Match Rule`
+                        ]
+                    )
+                }
+
+                // ====================================================
+                // Update customer
+                // ====================================================
+
+                await client.query(
+                    `
+                    UPDATE "Customer"
+
+                    SET
+                        "Points" = $1,
+                        "PrivilegedMatchRule" =
+                            $2
+
+                    WHERE
+                        "ID" = $3
+                    `,
+                    [
+                        points,
+                        privilegedmatchrule,
+                        customerid
+                    ]
+                )
+
+                await client.query(
+                    'COMMIT'
+                )
+
+                return res
+                    .status(200)
+                    .json({
+                        success: true,
+                        message:
+                            'Customer account updated successfully.',
+                        code: 20000
+                    })
+            } catch (error) {
+                await client.query(
+                    'ROLLBACK'
+                )
+
+                console.error(
+                    error
+                )
+
+                return res
+                    .status(500)
+                    .json({
+                        success: false,
+                        message:
+                            'Error updating customer account.',
+                        code: 500
+                    })
+            } finally {
+                client.release()
+            }
+        }
+    )
+
+    // ============================================================
+    // GET CUSTOMER LOGS
+    // Permission: customers.read
+    // ============================================================
+
+    router.get(
+        '/getcustomerlogs',
+        requirePermission('customers.read'),
+        async (req, res) => {
+            try {
+                const {
+                    id
+                } = req.query
+
+                const result =
+                    await pool.query(
+                        `
+                        SELECT
+                            "ID" AS id,
+                            "LogType" AS logtype,
+                            "OldValue" AS oldvalue,
+                            "NewValue" AS newvalue,
+                            "Description"
+                                AS description,
+                            "DateCreated"
+                                AS datecreated
+
+                        FROM "CustomerLog"
+
+                        WHERE
+                            "CustomerID" = $1
+
+                        ORDER BY
+                            "DateCreated" DESC
+                        `,
+                        [
+                            id
+                        ]
+                    )
+
+                return res
+                    .status(200)
+                    .json({
+                        success: true,
+                        message:
+                            'Customer logs retrieved successfully.',
+                        code: 20000,
+                        data:
+                            result.rows
+                    })
+            } catch (error) {
+                console.error(
+                    error
+                )
+
+                return res
+                    .status(500)
+                    .json({
+                        success: false,
+                        message:
+                            'Unable to retrieve customer logs.',
+                        code: 500
+                    })
+            }
+        }
+    )
+
+
+    // ============================================================
+    // GET CUSTOMER ACTIVITY
+    // Permission: customers.read
+    //
+    // Returns:
+    //   - Check-ins
+    //   - Check-outs
+    //   - CustomerMatch point activity
+    //   - Last 7 CustomerMatch images
+    // ============================================================
+
+    router.get(
+        '/getcustomeractivity',
+        requirePermission('customers.read'),
+        async (req, res) => {
+            try {
+                const {
+                    id,
+                    locationid
+                } = req.query
+
+                const customerId =
+                    Number(id)
+
+                const locationId =
+                    Number(locationid)
+
+                if (
+                    !Number.isInteger(customerId) ||
+                    customerId <= 0
+                ) {
+                    return res
+                        .status(400)
+                        .json({
+                            success: false,
+                            message:
+                                'Valid customer id is required.',
+                            code: 40000
+                        })
+                }
+
+                if (
+                    !Number.isInteger(locationId) ||
+                    locationId <= 0
+                ) {
+                    return res
+                        .status(400)
+                        .json({
+                            success: false,
+                            message:
+                                'Valid location id is required.',
+                            code: 40000
+                        })
+                }
+
+                // Make sure the customer belongs to the selected location.
+                const customerResult =
+                    await pool.query(
+                        `
+                        SELECT
+                            "ID"
+
+                        FROM "Customer"
+
+                        WHERE
+                            "ID" = $1
+                            AND "locationid" = $2
+
+                        LIMIT 1
+                        `,
+                        [
+                            customerId,
+                            locationId
+                        ]
+                    )
+
+                if (
+                    customerResult.rowCount === 0
+                ) {
+                    return res
+                        .status(404)
+                        .json({
+                            success: false,
+                            message:
+                                'Customer not found for this location.',
+                            code: 40400
+                        })
+                }
+
+                const activityResult =
+                    await pool.query(
+                        `
+                        SELECT *
+                        FROM
+                        (
+                            SELECT
+                                CONCAT(
+                                    'checkin-',
+                                    ck."ID"
+                                ) AS id,
+
+                                'CHECK_IN'
+                                    AS type,
+
+                                'Customer Checked In'
+                                    AS title,
+
+                                ck."CheckInDate"
+                                    AS date,
+
+                                'Customer checked in.'
+                                    AS description,
+
+                                ck."ID"
+                                    AS "checkinId",
+
+                                NULL::integer
+                                    AS points,
+
+                                NULL::text
+                                    AS "imageUrl",
+
+                                NULL::text
+                                    AS "machineNumber",
+
+                                NULL::text
+                                    AS "assignedBy"
+
+                            FROM "CheckIn" ck
+
+                            WHERE
+                                ck."CustomerId" = $1
+                                AND ck."LocationId" = $2
+
+
+                            UNION ALL
+
+
+                            SELECT
+                                CONCAT(
+                                    'checkout-',
+                                    ck."ID"
+                                ) AS id,
+
+                                'CHECK_OUT'
+                                    AS type,
+
+                                'Customer Checked Out'
+                                    AS title,
+
+                                ck."CheckOutDate"
+                                    AS date,
+
+                                'Customer checked out.'
+                                    AS description,
+
+                                ck."ID"
+                                    AS "checkinId",
+
+                                NULL::integer
+                                    AS points,
+
+                                NULL::text
+                                    AS "imageUrl",
+
+                                NULL::text
+                                    AS "machineNumber",
+
+                                NULL::text
+                                    AS "assignedBy"
+
+                            FROM "CheckIn" ck
+
+                            WHERE
+                                ck."CustomerId" = $1
+                                AND ck."LocationId" = $2
+                                AND ck."CheckOutDate"
+                                    IS NOT NULL
+
+
+                            UNION ALL
+
+
+                            SELECT
+                                CONCAT(
+                                    'match-',
+                                    cm."ID"
+                                ) AS id,
+
+                                'MATCH_POINTS'
+                                    AS type,
+
+                                'Match Points Received'
+                                    AS title,
+
+                                cm."DateAssign"
+                                    AS date,
+
+                                CONCAT(
+                                    'Customer received ',
+                                    COALESCE(
+                                        cm."Points",
+                                        0
+                                    ),
+                                    ' points',
+                                    CASE
+                                        WHEN
+                                            m."MachineNumber"
+                                            IS NOT NULL
+                                        THEN
+                                            CONCAT(
+                                                ' from machine ',
+                                                m."MachineNumber"
+                                            )
+                                        ELSE
+                                            ''
+                                    END,
+                                    '.'
+                                ) AS description,
+
+                                cm."CheckinId"
+                                    AS "checkinId",
+
+                                cm."Points"
+                                    AS points,
+
+                                cm."ImageUrl"
+                                    AS "imageUrl",
+
+                                m."MachineNumber"::text
+                                    AS "machineNumber",
+
+                                u."Name"
+                                    AS "assignedBy"
+
+                            FROM "CustomerMatch" cm
+
+                            LEFT JOIN "Machines" m
+                                ON m."ID" =
+                                   cm."MachineId"
+
+                            LEFT JOIN "Users" u
+                                ON u."ID" =
+                                   cm."AssignedBy"
+
+                            WHERE
+                                cm."CustomerId" = $1
+                                AND cm."LocationId" = $2
+                        )
+                        activity
+
+                        WHERE
+                            activity.date
+                                IS NOT NULL
+
+                        ORDER BY
+                            activity.date DESC
+                        `,
+                        [
+                            customerId,
+                            locationId
+                        ]
+                    )
+
+                const recentImagesResult =
+                    await pool.query(
+                        `
+                        SELECT
+                            cm."ID"
+                                AS id,
+
+                            cm."Points"
+                                AS points,
+
+                            cm."DateAssign"
+                                AS date,
+
+                            cm."ImageUrl"
+                                AS "imageUrl",
+
+                            cm."CheckinId"
+                                AS "checkinId",
+
+                            m."MachineNumber"::text
+                                AS "machineNumber",
+
+                            u."Name"
+                                AS "assignedBy"
+
+                        FROM "CustomerMatch" cm
+
+                        LEFT JOIN "Machines" m
+                            ON m."ID" =
+                               cm."MachineId"
+
+                        LEFT JOIN "Users" u
+                            ON u."ID" =
+                               cm."AssignedBy"
+
+                        WHERE
+                            cm."CustomerId" = $1
+                            AND cm."LocationId" = $2
+                            AND cm."ImageUrl"
+                                IS NOT NULL
+                            AND BTRIM(
+                                cm."ImageUrl"
+                            ) <> ''
+
+                        ORDER BY
+                            cm."DateAssign" DESC
+
+                        LIMIT 7
+                        `,
+                        [
+                            customerId,
+                            locationId
+                        ]
+                    )
+
+                return res
+                    .status(200)
+                    .json({
+                        success: true,
+                        message:
+                            'Customer activity retrieved successfully.',
+                        code: 20000,
+                        data: {
+                            activities:
+                                activityResult.rows,
+                            recentMatchImages:
+                                recentImagesResult.rows
+                        }
+                    })
+
+            } catch (error) {
+                console.error(
+                    'Get customer activity error:',
+                    error
+                )
+
+                return res
+                    .status(500)
+                    .json({
+                        success: false,
+                        message:
+                            'Unable to retrieve customer activity.',
+                        code: 50000
+                    })
             }
         }
     )

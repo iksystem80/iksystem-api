@@ -89,6 +89,11 @@ async function bonusGiveSessionBalance(db, session) {
             SELECT COALESCE(SUM(b."Amount"),0) total
             FROM "BonusAwards" b
             WHERE b."EmployeeSessionId"=$1
+        ),
+        lucky_birds AS (
+            SELECT COALESCE(SUM(lb."Amount"),0) total
+            FROM "LuckyBirdAwards" lb
+            WHERE lb."EmployeeSessionId"=$1
         )
         SELECT
             (
@@ -101,6 +106,7 @@ async function bonusGiveSessionBalance(db, session) {
                 - raffles.total
                 - tickets.total
                 - bonuses.total
+                - lucky_birds.total
             )::numeric(14,2) balance,
             cash.entries
         FROM cash
@@ -108,6 +114,7 @@ async function bonusGiveSessionBalance(db, session) {
         CROSS JOIN raffles
         CROSS JOIN tickets
         CROSS JOIN bonuses
+        CROSS JOIN lucky_birds
     `, [session.ID])
 
     return result.rows[0]
