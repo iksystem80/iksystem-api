@@ -121,7 +121,7 @@ startPromotionWorker()
 // ============================================
 
 app.get('/', (req, res) => {
-  res.status(200).json({ success: true, message: 'IKlogy API is running' })
+  res.status(200).json({ success: true, message: 'IK API is running' })
 })
 
 // ============================================
