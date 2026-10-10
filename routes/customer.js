@@ -485,8 +485,8 @@ module.exports = function (io) {
     // ============================================================
     // UPDATE STATUS
     // Permission: customers.update
-    // An unverified customer cannot be manually activated here.
-    // Activation requires OTP verification or authorized bypass.
+    // Account activation is independent from customer verification.
+    // Check-in still enforces Active / Blacklist / Verification rules.
     // ============================================================
 
     router.put(
@@ -495,43 +495,6 @@ module.exports = function (io) {
         async (req, res) => {
             try {
                 const { id } = req.query
-
-                const customerResult =
-                    await pool.query(
-                        `
-                        SELECT
-                            "ID",
-                            "IsActive",
-                            "PhoneVerified",
-                            "VerificationMethod"
-                        FROM "Customer"
-                        WHERE "ID" = $1
-                        `,
-                        [id]
-                    )
-
-                if (customerResult.rows.length === 0) {
-                    return res.status(404).json({
-                        success: false,
-                        message: 'Customer not found.',
-                        code: 40400,
-                    })
-                }
-
-                const customer = customerResult.rows[0]
-
-                if (
-                    customer.IsActive === false &&
-                    customer.PhoneVerified !== true &&
-                    customer.VerificationMethod !== 'Bypass'
-                ) {
-                    return res.status(403).json({
-                        success: false,
-                        message:
-                            'Phone verification or authorized bypass is required before activation.',
-                        code: 40300,
-                    })
-                }
 
                 const result =
                     await pool.query(
