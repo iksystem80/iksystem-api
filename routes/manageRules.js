@@ -1,6 +1,6 @@
 const express = require('express')
 const { pool } = require('../db')
-const { requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 
 module.exports = function () {
     const router = express.Router()
@@ -43,6 +43,8 @@ module.exports = function () {
             matchResetDayTime: row.MatchResetDayTime,
             nfcTicketOutEnabled: row.NfcTicketOutEnabled,
             auditVerificationEnabled: row.AuditVerificationEnabled,
+            luckyBirdEnabled: row.LuckyBirdEnabled,
+            luckyBirdMaxCustomersPerDay: Number(row.LuckyBirdMaxCustomersPerDay || 0),
             phoneVerificationRequired: row.PhoneVerificationRequired,
             nuVueBoostEnabled: row.NuVueBoostEnabled,
             ticketPhotoRequired: row.TicketPhotoRequired,
@@ -56,7 +58,7 @@ module.exports = function () {
 
     router.get(
         '/get',
-        requirePermission('managerules.read'),
+        requireModuleAccess('settings.manage-rules'),
         async (req, res) => {
             try {
                 const locationId = Number(req.query.locationid)
@@ -108,7 +110,7 @@ module.exports = function () {
 
     router.put(
         '/update',
-        requirePermission('managerules.update'),
+        requireModuleAccess('settings.manage-rules'),
         async (req, res) => {
             try {
                 const body = req.body || {}
@@ -129,6 +131,8 @@ module.exports = function () {
                 const resetDayTime = String(body.matchResetDayTime || '07:00')
                 const ticketPhotoMinAmount = Math.max(0, Number(body.ticketPhotoMinAmount || 0))
                 const vipMatchMinPoints = Math.max(0, Number(body.vipMatchMinPoints || 0))
+                const luckyBirdEnabled = parseBoolean(body.luckyBirdEnabled)
+                const luckyBirdMaxCustomersPerDay = Math.max(1, Math.floor(Number(body.luckyBirdMaxCustomersPerDay || 1)))
                 const updatedBy = req.authUser?.id || body.updatedBy || null
 
                 const result = await pool.query(
@@ -144,6 +148,8 @@ module.exports = function () {
                         "MatchResetDayTime",
                         "NfcTicketOutEnabled",
                         "AuditVerificationEnabled",
+                        "LuckyBirdEnabled",
+                        "LuckyBirdMaxCustomersPerDay",
                         "PhoneVerificationRequired",
                         "NuVueBoostEnabled",
                         "TicketPhotoRequired",
@@ -156,7 +162,7 @@ module.exports = function () {
                     VALUES
                     (
                         $1, $2, $3, $4, $5, $6::jsonb, $7::time,
-                        $8, $9, $10, $11, $12, $13, $14, $15, NOW(), $16
+                        $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), $18
                     )
                     ON CONFLICT ("LocationId")
                     DO UPDATE SET
@@ -168,6 +174,8 @@ module.exports = function () {
                         "MatchResetDayTime" = EXCLUDED."MatchResetDayTime",
                         "NfcTicketOutEnabled" = EXCLUDED."NfcTicketOutEnabled",
                         "AuditVerificationEnabled" = EXCLUDED."AuditVerificationEnabled",
+                        "LuckyBirdEnabled" = EXCLUDED."LuckyBirdEnabled",
+                        "LuckyBirdMaxCustomersPerDay" = EXCLUDED."LuckyBirdMaxCustomersPerDay",
                         "PhoneVerificationRequired" = EXCLUDED."PhoneVerificationRequired",
                         "NuVueBoostEnabled" = EXCLUDED."NuVueBoostEnabled",
                         "TicketPhotoRequired" = EXCLUDED."TicketPhotoRequired",
@@ -188,6 +196,8 @@ module.exports = function () {
                         resetDayTime,
                         parseBoolean(body.nfcTicketOutEnabled),
                         parseBoolean(body.auditVerificationEnabled),
+                        luckyBirdEnabled,
+                        luckyBirdMaxCustomersPerDay,
                         parseBoolean(body.phoneVerificationRequired),
                         parseBoolean(body.nuVueBoostEnabled),
                         parseBoolean(body.ticketPhotoRequired),

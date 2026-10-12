@@ -190,185 +190,21 @@ async function authenticate(
 }
 
 // ============================================================
-// REQUIRE PERMISSION
+// MODULE ACCESS
 //
-// This middleware automatically authenticates the request.
+// CRUD-style permission middleware has been removed.
 //
-// Example:
+// Page/module authorization is now handled by:
+//     routes/utils/moduleAccess.js
 //
-// router.get(
-//     '/getall',
-//     requirePermission('users.read'),
-//     async (req, res) => {}
-// )
+// That middleware checks:
+//     AppModules
+//     LocationModules
+//     LocationRoleModules
 //
-// You do NOT have to write:
-//
-// authenticate,
-// requirePermission(...)
-//
-// unless you prefer that pattern.
-//
-// SYSTEM ADMIN:
-//     Full system bypass.
-//
-// OWNER:
-//     Permission bypass, but company/location isolation
-//     is still enforced inside individual routes.
-//
-// OTHER ROLES:
-//     Checked against RolePermissions.
+// Owner and Admin DO NOT bypass module access.
+// System Admin bypass is handled only where appropriate.
 // ============================================================
-
-function requirePermission(
-    permissionCode
-) {
-    return async (
-        req,
-        res,
-        next
-    ) => {
-        try {
-
-            // ====================================================
-            // AUTHENTICATE FIRST
-            // ====================================================
-
-            if (!req.authUser) {
-                const authResult =
-                    await getAuthenticatedUser(
-                        req
-                    )
-
-                if (
-                    !authResult.success
-                ) {
-                    return res
-                        .status(
-                            authResult.status
-                        )
-                        .json({
-                            success: false,
-
-                            code:
-                                authResult.code,
-
-                            message:
-                                authResult.message
-                        })
-                }
-
-                req.authUser =
-                    authResult.user
-            }
-
-            // ====================================================
-            // NORMALIZE ROLE
-            // ====================================================
-
-            const roleName =
-                String(
-                    req.authUser
-                        .roleName ||
-                    ''
-                )
-                    .trim()
-                    .toLowerCase()
-
-            // ====================================================
-            // SYSTEM ADMIN BYPASS
-            // ====================================================
-
-            if (
-                roleName ===
-                'system admin'
-            ) {
-                return next()
-            }
-
-            // ====================================================
-            // OWNER BYPASS
-            //
-            // Owner has full permissions inside their company.
-            // Company isolation must still be enforced by routes.
-            // ====================================================
-
-            if (
-                roleName ===
-                'owner'
-            ) {
-                return next()
-            }
-
-            // ====================================================
-            // CHECK ROLE PERMISSION
-            // ====================================================
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        1
-
-                    FROM
-                        "RolePermissions" rp
-
-                    INNER JOIN
-                        "Permissions" p
-
-                        ON
-                            p."ID" =
-                                rp."PermissionId"
-
-                    WHERE
-                        rp."RoleId" = $1
-
-                        AND
-
-                        p."Code" = $2
-
-                    LIMIT 1
-                    `,
-                    [
-                        req.authUser
-                            .roleId,
-
-                        permissionCode
-                    ]
-                )
-
-            if (
-                !result.rowCount
-            ) {
-                return res
-                    .status(403)
-                    .json({
-                        success: false,
-                        code: 40300,
-                        message:
-                            'You do not have permission to perform this action.'
-                    })
-            }
-
-            return next()
-
-        } catch (error) {
-            console.error(
-                'Permission middleware error:',
-                error
-            )
-
-            return res
-                .status(500)
-                .json({
-                    success: false,
-                    code: 50000,
-                    message:
-                        'Unable to verify permission.'
-                })
-        }
-    }
-}
 
 // ============================================================
 // REQUIRE SYSTEM ADMIN
@@ -471,7 +307,7 @@ async function requireSystemAdmin(
 // ============================================================
 
 module.exports = {
+    getAuthenticatedUser,
     authenticate,
-    requirePermission,
     requireSystemAdmin
 }

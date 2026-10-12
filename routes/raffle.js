@@ -1,8 +1,9 @@
 const express = require('express')
 const multer = require('multer')
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const cloudinary = require('../config/cloudinary')
-const { authenticate, requirePermission } = require('../middleware/auth')
+const { authenticate } = require('../middleware/auth')
 
 const router = express.Router()
 router.use(authenticate)
@@ -86,7 +87,7 @@ async function spin(db, req, raffleId) {
     }
 }
 
-router.get('/state', requirePermission('clock.read'), async (req, res) => {
+router.get('/state', requireModuleAccess('raffle'), async (req, res) => {
     try {
         const session = await activeSession(pool, req)
         const locationId = Number(session?.LocationId || req.authUser?.locationId)
@@ -96,7 +97,7 @@ router.get('/state', requirePermission('clock.read'), async (req, res) => {
     } catch (error) { console.error('Raffle state:', error); return fail(res, 500, 'Unable to load raffle.') }
 })
 
-router.post('/start', requirePermission('clock.read'), async (req, res) => {
+router.post('/start', requireModuleAccess('raffle'), async (req, res) => {
     const client = await pool.connect()
     try {
         await client.query('BEGIN')
@@ -122,7 +123,7 @@ router.post('/start', requirePermission('clock.read'), async (req, res) => {
     } finally { client.release() }
 })
 
-router.get('/checked-in-customers', requirePermission('clock.read'), async (req, res) => {
+router.get('/checked-in-customers', requireModuleAccess('raffle'), async (req, res) => {
     try {
         const session = await activeSession(pool, req)
         if (!session) return fail(res, 409, 'No active employee session.')
@@ -133,7 +134,7 @@ router.get('/checked-in-customers', requirePermission('clock.read'), async (req,
     } catch (error) { console.error('Raffle customers:', error); return fail(res, 500, 'Unable to load checked-in customers.') }
 })
 
-router.post('/:id/complete', requirePermission('clock.update'), upload.single('image'), async (req, res) => {
+router.post('/:id/complete', requireModuleAccess('raffle'), upload.single('image'), async (req, res) => {
     const client = await pool.connect()
     try {
         const amount = Number(req.body.amount)
@@ -204,7 +205,7 @@ router.post('/:id/complete', requirePermission('clock.update'), upload.single('i
     } finally { client.release() }
 })
 
-router.get('/settings', requirePermission('clock.read'), async (req, res) => {
+router.get('/settings', requireModuleAccess('settings.raffle'), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid || req.authUser.locationId)
         if (!validId(locationId)) return fail(res, 400, 'Location is required.')
@@ -216,7 +217,7 @@ router.get('/settings', requirePermission('clock.read'), async (req, res) => {
     } catch (error) { console.error('Raffle settings:', error); return fail(res, 500, 'Unable to load raffle settings.') }
 })
 
-router.put('/settings', requirePermission('clock.read'), async (req, res) => {
+router.put('/settings', requireModuleAccess('settings.raffle'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Only management can change raffle settings.')
         const locationId = Number(req.body.locationid || req.authUser.locationId)
@@ -230,7 +231,7 @@ router.put('/settings', requirePermission('clock.read'), async (req, res) => {
     } catch (error) { console.error('Raffle settings save:', error); return fail(res, 500, 'Unable to save raffle settings.') }
 })
 
-router.get('/winners', requirePermission('clock.read'), async (req, res) => {
+router.get('/winners', requireModuleAccess('raffle'), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid || req.authUser.locationId)
         const result = await pool.query(`SELECT r."WinnerCustomerId" AS "customerId", c."Firstname" AS firstname, c."Lastname" AS lastname,
@@ -243,7 +244,7 @@ router.get('/winners', requirePermission('clock.read'), async (req, res) => {
     } catch (error) { console.error('Raffle winners:', error); return fail(res, 500, 'Unable to load winner history.') }
 })
 
-router.get('/winners/:customerId', requirePermission('clock.read'), async (req, res) => {
+router.get('/winners/:customerId', requireModuleAccess('raffle'), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid || req.authUser.locationId)
         const customerId = Number(req.params.customerId)

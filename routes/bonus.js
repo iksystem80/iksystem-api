@@ -3,8 +3,8 @@ const multer = require('multer')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const cloudinary = require('../config/cloudinary')
-const { requirePermission } = require('../middleware/auth')
 
 const bonusGiveUpload = multer({
     storage: multer.memoryStorage(),
@@ -432,7 +432,7 @@ async function insertScheduleBlocks(
 
 router.get(
     '/active/current/list',
-    requirePermission('bonus.read'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         try {
             const locationId =
@@ -591,7 +591,7 @@ router.get(
 
 router.get(
     '/give/state',
-    requirePermission('clock.read'),
+    requireModuleAccess('bonus'),
     async (req, res) => {
         try {
             const session = await activeBonusGiveSession(pool, req)
@@ -621,7 +621,7 @@ router.get(
 
 router.get(
     '/give/machine',
-    requirePermission('clock.read'),
+    requireModuleAccess('bonus'),
     async (req, res) => {
         try {
             const session = await activeBonusGiveSession(pool, req)
@@ -675,7 +675,7 @@ router.get(
 
 router.get(
     '/give/active/list',
-    requirePermission('clock.read'),
+    requireModuleAccess('bonus'),
     async (req, res) => {
         try {
             const session = await activeBonusGiveSession(pool, req)
@@ -732,7 +732,7 @@ router.get(
 
 router.post(
     '/give/save',
-    requirePermission('clock.update'),
+    requireModuleAccess('bonus'),
     bonusGiveUpload.single('image'),
     async (req, res) => {
         const client = await pool.connect()
@@ -940,7 +940,7 @@ router.post(
 
 router.get(
     '/',
-    requirePermission('bonus.read'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         try {
             const locationId =
@@ -1039,7 +1039,7 @@ router.get(
 
 router.get(
     '/:id',
-    requirePermission('bonus.read'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         try {
             const bonusId =
@@ -1229,7 +1229,7 @@ router.get(
 
 router.post(
     '/',
-    requirePermission('bonus.create'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -1348,7 +1348,7 @@ router.post(
 
 router.put(
     '/:id',
-    requirePermission('bonus.update'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -1512,7 +1512,7 @@ router.put(
 
 router.patch(
     '/:id/status',
-    requirePermission('bonus.update'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         try {
             const bonusId =
@@ -1607,7 +1607,7 @@ router.patch(
 
 router.delete(
     '/:id',
-    requirePermission('bonus.delete'),
+    requireModuleAccess('settings.bonus'),
     async (req, res) => {
         try {
             const bonusId =

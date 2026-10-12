@@ -2,11 +2,12 @@ const express = require('express')
 const multer = require('multer')
 const path = require('path')
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const cloudinary = require('../config/cloudinary')
 const pgvector = require('pgvector')
 const { initFaceApi, createFaceEmbedding, FaceDetectionError } = require('../face')
-const { requirePermission } = require('../middleware/auth')
 const { checkMatchEligibility } = require('../utils/matchRules')
+const { setSocketIO } = require('../utils/realtime')
 
 const uploadToCloudinary = (fileBuffer, folder) => {
     return new Promise((resolve, reject) => {
@@ -33,6 +34,7 @@ const uploadToCloudinary = (fileBuffer, folder) => {
 // ============================================================
 
 module.exports = function (io) {
+    setSocketIO(io)
     const router = express.Router()
 
     // ============================================================
@@ -63,7 +65,7 @@ module.exports = function (io) {
 
     router.post(
         '/savecustomer',
-        requirePermission('customers.create'),
+        requireModuleAccess('customers'),
         upload.single('image'),
         async (req, res) => {
             try {
@@ -202,7 +204,7 @@ module.exports = function (io) {
 
     router.post(
         '/uploadphoto',
-        requirePermission('customers.create'),
+        requireModuleAccess('customers'),
         upload.single('image'),
         async (req, res) => {
             try {
@@ -245,7 +247,7 @@ module.exports = function (io) {
 
     router.get(
         '/getall',
-        requirePermission('customers.read'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -347,7 +349,7 @@ module.exports = function (io) {
 
     router.get(
         '/getcustomerbyid',
-        requirePermission('customers.read'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -444,7 +446,7 @@ module.exports = function (io) {
 
     router.delete(
         '/delete',
-        requirePermission('customers.delete'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -491,7 +493,7 @@ module.exports = function (io) {
 
     router.put(
         '/updatestatus',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const { id } = req.query
@@ -542,7 +544,7 @@ module.exports = function (io) {
 
     router.post(
         '/checkin',
-        requirePermission('checkin.update'),
+        requireModuleAccess('checkin'),
         upload.single('image'),
         async (req, res) => {
             try {
@@ -882,7 +884,7 @@ module.exports = function (io) {
 
     router.post(
         '/checkout',
-        requirePermission('checkin.update'),
+        requireModuleAccess('checkin'),
         upload.single('image'),
         async (req, res) => {
             try {
@@ -1000,7 +1002,7 @@ module.exports = function (io) {
 
     router.get(
         '/getcheckin',
-        requirePermission('customers.read'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -1205,7 +1207,7 @@ module.exports = function (io) {
 
     router.put(
         '/approvecheckin',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -1276,7 +1278,7 @@ module.exports = function (io) {
 
     router.get(
         '/checkmatcheligibility',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const customerId = Number(req.query.customerid)
@@ -1323,7 +1325,7 @@ module.exports = function (io) {
 
     router.post(
         '/saveassignmachine',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         upload.single('image'),
         async (req, res) => {
             const client = await pool.connect()
@@ -1425,7 +1427,7 @@ module.exports = function (io) {
 
     router.post(
         '/saveextramatch',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         upload.single('image'),
         async (req, res) => {
             const client = await pool.connect()
@@ -1502,7 +1504,7 @@ module.exports = function (io) {
 
     router.put(
         '/updatecustomeraccount',
-        requirePermission('customers.update'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             const client = await pool.connect()
 
@@ -1738,7 +1740,7 @@ module.exports = function (io) {
 
     router.get(
         '/getcustomerlogs',
-        requirePermission('customers.read'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {
@@ -1812,7 +1814,7 @@ module.exports = function (io) {
 
     router.get(
         '/getcustomeractivity',
-        requirePermission('customers.read'),
+        requireModuleAccess('customers'),
         async (req, res) => {
             try {
                 const {

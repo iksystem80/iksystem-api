@@ -494,46 +494,32 @@ router.get(
                     })
                 }
             }
-
             // ====================================================
-            // LOAD ROLE PERMISSIONS
+            // LOAD LOCATION + ROLE MODULE ACCESS
+            // CRUD permissions are no longer used. The frontend keeps the
+            // existing `permissions` array name, but it now contains module codes.
             // ====================================================
-
-            const permissionResult =
-                await pool.query(
-                    `
-                    SELECT
-                        p."Code"
-                            AS "code"
-
-                    FROM
-                        "RolePermissions" rp
-
-                    INNER JOIN
-                        "Permissions" p
-
-                        ON
-                            p."ID" =
-                                rp."PermissionId"
-
-                    WHERE
-                        rp."RoleId" = $1
-
-                    ORDER BY
-                        p."Code"
-                    `,
-                    [
-                        dbUser.RoleId
-                    ]
-                )
-
-            const permissions =
-                permissionResult.rows.map(
-                    row =>
-                        row.code
-                )
-
-            // ====================================================
+            let permissionResult
+            if (normalizedRole === 'system admin') {
+                permissionResult = await pool.query(`
+                    SELECT "Code" AS code
+                    FROM "AppModules"
+                    WHERE "IsActive"=true
+                    ORDER BY "SortOrder","Code"`)
+            } else {
+                permissionResult = await pool.query(`
+                    SELECT m."Code" AS code
+                    FROM "LocationRoleModules" lrm
+                    JOIN "LocationModules" lm
+                      ON lm."LocationId"=lrm."LocationId" AND lm."ModuleId"=lrm."ModuleId"
+                    JOIN "AppModules" m
+                      ON m."ID"=lrm."ModuleId" AND m."IsActive"=true
+                    WHERE lrm."LocationId"=$1
+                      AND lrm."RoleId"=$2
+                    ORDER BY m."SortOrder",m."Code"`, [dbUser.LocationId, dbUser.RoleId])
+            }
+            const permissions = permissionResult.rows.map(row => row.code)
+// ====================================================
             // LOAD AVAILABLE LOCATIONS
             //
             // System Admin:

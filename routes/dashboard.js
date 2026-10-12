@@ -1,7 +1,8 @@
 const express = require('express')
 const router = express.Router()
-const {  authenticate,requirePermission } = require('../middleware/auth')
+const { authenticate } = require('../middleware/auth')
 const { pool } = require('../db')
+const { requireModuleAccess, requireAnyAssignedModule } = require('../utils/moduleAccess')
 
 // ============================================================
 // HELPER
@@ -302,7 +303,7 @@ router.get(
 
 router.get(
     '/match-points-by-employee',  authenticate,
-    requirePermission('customers.read'),
+    requireAnyAssignedModule(),
     async (req, res) => {
 
         try {

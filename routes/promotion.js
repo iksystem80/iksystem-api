@@ -2,8 +2,8 @@ const express = require('express')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const { writePromotionAudit } = require('../services/promotionAudit')
-const { requirePermission } = require('../middleware/auth')
 
 function userId(req) {
   return Number(req.authUser?.id || 0)
@@ -19,7 +19,7 @@ function locationId(req) {
 
 router.get(
   '/list',
-  requirePermission('promotion.read'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -70,7 +70,7 @@ router.get(
 
 router.get(
   '/detail',
-  requirePermission('promotion.read'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -127,7 +127,7 @@ router.get(
 
 router.post(
   '/create',
-  requirePermission('promotion.create'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -208,7 +208,7 @@ router.post(
 
 router.put(
   '/update',
-  requirePermission('promotion.update'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -279,7 +279,7 @@ router.put(
 
 router.post(
   '/recipients',
-  requirePermission('promotion.update'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
     const client =
       await pool.connect()
@@ -501,7 +501,7 @@ router.post(
 
 router.get(
   '/recipients',
-  requirePermission('promotion.read'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -552,7 +552,7 @@ router.get(
 
 router.post(
   '/send',
-  requirePermission('promotion.send'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -761,7 +761,7 @@ router.post('/twilio/status', async (req, res) => {
 
 router.get(
   '/logs',
-  requirePermission('promotion.logs.read'),
+  requireModuleAccess('promotions.list'),
   async (req, res) => {
   try {
     const cid = companyId(req)

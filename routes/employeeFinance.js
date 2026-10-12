@@ -1,7 +1,9 @@
 const express = require('express')
 const router = express.Router()
 const { pool } = require('../db')
-const { authenticate, requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
+const { authenticate } = require('../middleware/auth')
+const { emitAppRefresh } = require('../utils/realtime')
 router.use(authenticate)
 
 const ok = (res, data, message = 'Success.') => res.json({ success: true, code: 20000, message, data })
@@ -317,7 +319,8 @@ async function custodyTrail(locationId, filter = {}) {
         WHERE e."LocationId"=$1
           AND (e."Kind" IN ('CUTOVER_OPENING','OWNER_DISTRIBUTION','DIRECT_EXPENSE')
               OR (e."Kind" IN ('BANK_DEPOSIT','BANK_WITHDRAWAL') AND a."Kind"='BANK')
-              OR (e."Kind"='EMPLOYEE_CASH_TAKEN' AND e."SessionTransactionId" IS NULL))
+              OR (e."Kind"='EMPLOYEE_CASH_TAKEN' AND e."SessionTransactionId" IS NULL)
+              OR (e."Kind"='EMPLOYEE_SUPPORT' AND e."FundingId" IS NULL))
           ${timeWhere('e."CreatedAt"')}
           AND ($6::integer IS NULL OR e."CreatedBy"=$6 OR a."UserId"=$6)
         ORDER BY "eventAt" DESC,id DESC`, params)
@@ -325,7 +328,7 @@ async function custodyTrail(locationId, filter = {}) {
 }
 
 // Fresh transaction dropdown types. These routes are intentionally scoped to normal employee transactions.
-router.get('/expense-types', requirePermission('clock.read'), async (req, res) => {
+router.get('/expense-types', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!req.authUser?.id || !validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
         const locationId = Number(req.query.locationid)
@@ -338,7 +341,7 @@ router.get('/expense-types', requirePermission('clock.read'), async (req, res) =
     } catch (e) { console.error('Finance expense types:', e); return fail(res, 500, 'Unable to load expense types.') }
 })
 
-router.get('/credit-types', requirePermission('clock.read'), async (req, res) => {
+router.get('/credit-types', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!req.authUser?.id || !validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
         const locationId = Number(req.query.locationid)
@@ -352,7 +355,7 @@ router.get('/credit-types', requirePermission('clock.read'), async (req, res) =>
 })
 
 // Employee session and live transaction ledger; authenticated user identity is server-derived.
-router.get('/current', requirePermission('clock.read'), async (req, res) => {
+router.get('/current', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!req.authUser?.id || !validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
         const locationId = Number(req.query.locationid)
@@ -452,7 +455,7 @@ router.get('/current', requirePermission('clock.read'), async (req, res) => {
 })
 
 // Opening cash is entered once. A pending incoming handover must be confirmed first.
-router.post('/opening', requirePermission('clock.update'), async (req, res) => {
+router.post('/opening', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         const amount = money(req.body.amount, true)
@@ -462,20 +465,163 @@ router.post('/opening', requirePermission('clock.update'), async (req, res) => {
         const s = await ownSession(client, req, req.body.sessionid, true)
         if (!s) { await client.query('ROLLBACK'); return fail(res, 403, 'Session access denied.') }
         if (s.ClockOut) { await client.query('ROLLBACK'); return fail(res, 409, 'Session is closed.') }
-        // Employee may set one manual Opening Bank entry even when incoming cash is pending
-        // or has already been accepted into this session.
+
+        // Serialize manual Opening Bank against shift-close custody movement and reservations.
         await client.query('SELECT pg_advisory_xact_lock(80471,$1::integer)', [s.LocationId])
-        const existing = await client.query(`SELECT "ID" FROM "SessionCashTransactions" WHERE "SessionId"=$1 AND "Type"='OPENING' LIMIT 1`, [s.ID])
-        if (existing.rowCount) { await client.query('ROLLBACK'); return fail(res, 409, 'Opening Bank has already been entered for this session.') }
-        await client.query(`INSERT INTO "SessionCashTransactions"
-            ("SessionId","LocationId","Type","Amount","Notes","CreatedBy")
-            VALUES ($1,$2,'OPENING',$3,$4,$5)`, [s.ID, s.LocationId, amount, note(req.body.notes), s.UserId])
-        await client.query('COMMIT'); return ok(res, null, 'Opening Bank saved.')
-    } catch (e) { await client.query('ROLLBACK'); console.error('Finance opening:', e); return fail(res, 500, 'Unable to save opening cash.') }
-    finally { client.release() }
+
+        const existing = await client.query(`
+            SELECT "ID"
+            FROM "SessionCashTransactions"
+            WHERE "SessionId"=$1 AND "Type"='OPENING'
+            LIMIT 1`, [s.ID])
+
+        if (existing.rowCount) {
+            await client.query('ROLLBACK')
+            return fail(res, 409, 'Opening Bank has already been entered for this session.')
+        }
+
+        const pendingIncoming = await client.query(`
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM "SessionCashHandovers" h
+                    WHERE h."ToUserId"=$1
+                      AND h."LocationId"=$2
+                      AND h."Status"='Pending'
+                )
+                OR
+                EXISTS (
+                    SELECT 1
+                    FROM "AdminCashFunding" f
+                    WHERE f."ToUserId"=$1
+                      AND f."LocationId"=$2
+                      AND f."Status"='Pending'
+                ) AS pending`,
+            [s.UserId, s.LocationId])
+
+        let adminDeducted = false
+        let adminDeductedAmount = 0
+        let sourceAdminUserId = null
+
+        // Only the FIRST employee session after the most recent close-to-Admin shift
+        // may create an automatic Admin custody deduction through manual Opening Bank.
+        // EMPLOYEE_CASH_TAKEN is the custody marker created when a session closes to Admin.
+        if (!pendingIncoming.rows[0]?.pending && Number(amount) > 0) {
+            const lastAdminShiftClose = await client.query(`
+                SELECT
+                    e."ID" AS "entryId",
+                    e."AccountId" AS "accountId",
+                    e."CreatedAt" AS "closedAt",
+                    a."UserId" AS "adminUserId"
+                FROM "LocationCashEntries" e
+                JOIN "LocationCashAccounts" a
+                  ON a."ID"=e."AccountId"
+                 AND a."LocationId"=e."LocationId"
+                WHERE e."LocationId"=$1
+                  AND e."Kind"='EMPLOYEE_CASH_TAKEN'
+                  AND e."Amount">=0
+                  AND a."Kind"='ADMIN'
+                  AND e."CreatedAt" < $2
+                ORDER BY e."CreatedAt" DESC, e."ID" DESC
+                LIMIT 1
+                FOR UPDATE OF e`,
+                [s.LocationId, s.ClockIn])
+
+            const close = lastAdminShiftClose.rows[0]
+
+            if (close) {
+                const firstSessionAfterClose = await client.query(`
+                    SELECT es."ID" AS id
+                    FROM "EmployeeSession" es
+                    WHERE es."LocationId"=$1
+                      AND es."ClockIn" > $2
+                    ORDER BY es."ClockIn" ASC, es."ID" ASC
+                    LIMIT 1`,
+                    [s.LocationId, close.closedAt])
+
+                const isFirstSessionAfterShiftClose =
+                    Number(firstSessionAfterClose.rows[0]?.id) === Number(s.ID)
+
+                if (isFirstSessionAfterShiftClose) {
+                    const custody = await client.query(`
+                        SELECT
+                            COALESCE(SUM(e."Amount"),0)::numeric(14,2) AS balance,
+                            (
+                                COALESCE((
+                                    SELECT SUM(t."Amount")
+                                    FROM "LocationCashTransfers" t
+                                    WHERE t."FromAccountId"=$1
+                                      AND t."Status"='Pending'
+                                ),0)
+                                +
+                                COALESCE((
+                                    SELECT SUM(f."Amount")
+                                    FROM "AdminCashFunding" f
+                                    WHERE f."CustodySourceAccountId"=$1
+                                      AND f."Status"='Pending'
+                                ),0)
+                            )::numeric(14,2) AS reserved
+                        FROM "LocationCashEntries" e
+                        WHERE e."AccountId"=$1`,
+                        [close.accountId])
+
+                    const balance = Number(custody.rows[0]?.balance || 0)
+                    const reserved = Number(custody.rows[0]?.reserved || 0)
+                    const available = balance - reserved
+
+                    if (available < Number(amount)) {
+                        await client.query('ROLLBACK')
+                        return fail(
+                            res,
+                            409,
+                            `Admin available balance is insufficient for this Opening Bank. Available: $${available.toFixed(2)}.`
+                        )
+                    }
+
+                    await client.query(`
+                        INSERT INTO "LocationCashEntries"
+                            ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes")
+                        VALUES ($1,$2,$3,'EMPLOYEE_SUPPORT',$4,$5)`,
+                        [
+                            s.LocationId,
+                            close.accountId,
+                            -Number(amount),
+                            s.UserId,
+                            `Opening Bank released to employee session #${s.ID} · first session after last shift close`
+                        ])
+
+                    adminDeducted = true
+                    adminDeductedAmount = Number(amount)
+                    sourceAdminUserId = close.adminUserId ? Number(close.adminUserId) : null
+                }
+            }
+        }
+
+        await client.query(`
+            INSERT INTO "SessionCashTransactions"
+                ("SessionId","LocationId","Type","Amount","Notes","CreatedBy")
+            VALUES ($1,$2,'OPENING',$3,$4,$5)`,
+            [s.ID, s.LocationId, amount, note(req.body.notes), s.UserId])
+
+        await client.query('COMMIT')
+
+        return ok(res, {
+            adminDeducted,
+            adminDeductedAmount,
+            sourceAdminUserId
+        }, adminDeducted
+            ? 'Opening Bank saved and deducted from Admin balance.'
+            : 'Opening Bank saved.')
+    } catch (e) {
+        try { await client.query('ROLLBACK') } catch { }
+        console.error('Finance opening:', e)
+        return fail(res, 500, 'Unable to save opening cash.')
+    } finally {
+        client.release()
+    }
 })
 
-router.post('/transaction', requirePermission('clock.update'), async (req, res) => {
+router.post('/transaction', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         const amount = money(req.body.amount)
@@ -519,7 +665,7 @@ router.post('/transaction', requirePermission('clock.update'), async (req, res) 
 
 // Transfer cash between two currently active employee sessions.
 // Sender gets TRANSFER_OUT; recipient gets TRANSFER_IN immediately.
-router.post('/transfer-to-employee', requirePermission('clock.update'), async (req, res) => {
+router.post('/transfer-to-employee', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
 
     try {
@@ -629,7 +775,7 @@ router.post('/transfer-to-employee', requirePermission('clock.update'), async (r
     }
 })
 
-router.post('/handover-and-clockout', requirePermission('clock.update'), async (req, res) => {
+router.post('/handover-and-clockout', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         if (!validId(req.body.touserid)) return fail(res, 400, 'Choose the receiving employee.')
@@ -679,6 +825,14 @@ router.post('/handover-and-clockout', requirePermission('clock.update'), async (
             "TotalWorkingHours"=ROUND((EXTRACT(EPOCH FROM (NOW()-"ClockIn"))/3600)::numeric,2)
             WHERE "ID"=$1 AND "ClockOut" IS NULL`, [s.ID])
         await client.query('COMMIT')
+
+        emitAppRefresh(
+            s.LocationId,
+            ['adminTransactions', 'employeeSessions'],
+            'employee-shift-closed',
+            { sessionId: s.ID, closeType: 'employee-handover' }
+        )
+
         return ok(res, {
             handoverId: transfer.rows[0].id,
             closingBalance: totals.balance,
@@ -695,7 +849,7 @@ router.post('/handover-and-clockout', requirePermission('clock.update'), async (
 
 // Atomic session closing to Admin custody.
 // This closes the employee session without creating an OWNER_WITHDRAWAL transaction.
-router.post('/close-to-admin-and-clockout', requirePermission('clock.update'), async (req, res) => {
+router.post('/close-to-admin-and-clockout', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         if (!validId(req.body.toadminid)) return fail(res, 400, 'Choose the receiving Admin.')
@@ -802,6 +956,17 @@ router.post('/close-to-admin-and-clockout', requirePermission('clock.update'), a
 
         await client.query('COMMIT')
 
+        emitAppRefresh(
+            s.LocationId,
+            ['adminTransactions', 'employeeSessions'],
+            'employee-shift-closed',
+            {
+                sessionId: s.ID,
+                closeType: 'admin-custody',
+                toAdminId: Number(req.body.toadminid)
+            }
+        )
+
         return ok(res, {
             closingBalance: totals.balance,
             actualCash,
@@ -820,7 +985,7 @@ router.post('/close-to-admin-and-clockout', requirePermission('clock.update'), a
 })
 
 // Only designated recipient, on their own active session, can accept. One accepted transfer = one credit.
-router.post('/handovers/:id/accept', requirePermission('clock.update'), async (req, res) => {
+router.post('/handovers/:id/accept', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         if (!validId(req.params.id)) return fail(res, 400, 'Invalid handover.')
@@ -854,7 +1019,7 @@ router.post('/handovers/:id/accept', requirePermission('clock.update'), async (r
 
 // Historical session cash reconciliation; employees see their own, admins see their location.
 // Quick filters use Austin/Chicago calendar boundaries: today or current week.
-router.get('/history', requirePermission('clock.read'), async (req, res) => {
+router.get('/history', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid)
         if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
@@ -925,7 +1090,7 @@ router.get('/history', requirePermission('clock.read'), async (req, res) => {
 // Full Session Cash History report.
 // Empty start/end dates mean all-time. Admins may filter employees;
 // regular employees are always restricted to their own sessions.
-router.get('/history/report', requirePermission('clock.read'), async (req, res) => {
+router.get('/history/report', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid)
         if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
@@ -1047,7 +1212,7 @@ router.get('/history/report', requirePermission('clock.read'), async (req, res) 
 // Amount and actor are always resolved by the server.
 // ============================================================
 
-router.get('/reading-profit/:sessionId', requirePermission('clock.read'), async (req, res) => {
+router.get('/reading-profit/:sessionId', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.query.locationid)
@@ -1072,7 +1237,7 @@ router.get('/reading-profit/:sessionId', requirePermission('clock.read'), async 
     }
 })
 
-router.post('/reading-profit/:sessionId', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     const client = await pool.connect()
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
@@ -1244,7 +1409,7 @@ router.post('/reading-profit/:sessionId', requirePermission('employeesession.upd
 // They are intentionally independent from the LocationCash custody ledger.
 // ============================================================
 
-router.get('/admin/reading-session-expenses/:sessionId', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/reading-session-expenses/:sessionId', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
             return fail(res, 403, 'Admin access required.')
@@ -1281,7 +1446,7 @@ router.get('/admin/reading-session-expenses/:sessionId', requirePermission('cloc
     }
 })
 
-router.get('/admin/reading-session-credits/:sessionId', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/reading-session-credits/:sessionId', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
             return fail(res, 403, 'Admin access required.')
@@ -1318,7 +1483,7 @@ router.get('/admin/reading-session-credits/:sessionId', requirePermission('clock
     }
 })
 
-router.post('/admin/reading-session-expense', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/reading-session-expense', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     const client = await pool.connect()
 
     try {
@@ -1396,7 +1561,7 @@ router.post('/admin/reading-session-expense', requirePermission('employeesession
     }
 })
 
-router.post('/admin/reading-session-credit', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/reading-session-credit', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     const client = await pool.connect()
 
     try {
@@ -1476,7 +1641,7 @@ router.post('/admin/reading-session-credit', requirePermission('employeesession.
 
 // Admin live cash ledger used by AdminTransactions.vue.
 // Returns only the signed-in Admin's custody account entries.
-router.get('/admin/cash-ledger', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/cash-ledger', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
             return fail(res, 403, 'Admin access required.')
@@ -1516,6 +1681,7 @@ router.get('/admin/cash-ledger', requirePermission('clock.read'), async (req, re
                     WHEN e."Kind"='EMPLOYEE_CASH_TAKEN' THEN 'Employee Session Close'
                     WHEN e."Kind"='INITIAL_CAPITAL' THEN 'Initial Capital'
                     WHEN e."Kind"='CUTOVER_OPENING' THEN 'Opening Bank'
+                    WHEN e."Kind"='EMPLOYEE_SUPPORT' AND e."FundingId" IS NULL THEN 'Employee Opening Bank'
                     WHEN e."Kind"='EMPLOYEE_SUPPORT' THEN 'Employee Funding'
                     WHEN e."Kind"='BANK_WITHDRAWAL' THEN 'Bank Withdrawal'
                     WHEN e."Kind"='OWNER_DISTRIBUTION' THEN 'Owner Distribution'
@@ -1540,7 +1706,7 @@ router.get('/admin/cash-ledger', requirePermission('clock.read'), async (req, re
 // "Add Bank" for the current Admin custody account.
 // BANK_DEPOSIT is reused as the internal custody-ledger credit kind;
 // the UI terminology remains "Add Bank".
-router.post('/admin/add-bank', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/add-bank', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     const client = await pool.connect()
 
     try {
@@ -1639,7 +1805,7 @@ router.post('/admin/add-bank', requirePermission('employeesession.update'), asyn
 // ============================================================
 
 // Activity metrics only; never used as a running balance. Inclusive Chicago business dates.
-router.get('/admin/activity', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/activity', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.query.locationid)
@@ -1700,7 +1866,7 @@ router.get('/admin/activity', requirePermission('clock.read'), async (req, res) 
 
 // Owner/Admin dashboard: selectable employees, business funding,
 // reconciliation totals, and complete immutable money trail.
-router.get('/admin/overview', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/overview', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.query.locationid)
@@ -1718,8 +1884,10 @@ router.get('/admin/overview', requirePermission('clock.read'), async (req, res) 
                          AND es."ClockOut" IS NULL
                    ) AS "clockedIn"
             FROM "Users" u
+            INNER JOIN "Roles" r ON r."ID"=u."RoleId"
             WHERE u."LocationId"=$1
               AND COALESCE(u."IsActive",true)=true
+              AND LOWER(BTRIM(r."Name"))='employee'
               AND u."ID"<>$2
             ORDER BY name`,
             [locationId, Number(req.authUser.id)])
@@ -2056,7 +2224,7 @@ router.get('/admin/overview', requirePermission('clock.read'), async (req, res) 
 
 // Quick Complete Money Trail for the transaction page.
 // Exact calendar filters: today or current week.
-router.get('/admin/trail', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/trail', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.query.locationid)
@@ -2204,7 +2372,7 @@ router.get('/admin/trail', requirePermission('clock.read'), async (req, res) => 
 
 // Full owner/admin Money Trail report.
 // Blank dates = all time. Optional employee filter.
-router.get('/admin/trail/report', requirePermission('clock.read'), async (req, res) => {
+router.get('/admin/trail/report', requireModuleAccess('transaction.employee'), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.query.locationid)
@@ -2524,7 +2692,7 @@ router.get('/admin/trail/report', requirePermission('clock.read'), async (req, r
 
 // Owner/Admin removes physical cash from an employee's active session.
 // This is NOT an operating expense; it is a separate audited session debit.
-router.post('/admin/withdrawal', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/withdrawal', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     const client = await pool.connect()
     try {
         if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin') return fail(res, 403, 'Only an Admin can receive cash directly from an employee.')
@@ -2623,7 +2791,7 @@ router.post('/admin/withdrawal', requirePermission('employeesession.update'), as
 
 // Owner/Admin creates physical business cash for an employee.
 // The employee must explicitly confirm receipt before their session is credited.
-router.post('/admin/funding', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/funding', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin') return fail(res, 403, 'Only an Admin can send business support directly to employees.')
         const locationId = Number(req.body.locationid)
@@ -2640,10 +2808,15 @@ router.post('/admin/funding', requirePermission('employeesession.update'), async
         if (custodyStarted.rowCount) return fail(res, 409, 'Use the custody ledger to send Admin cash to employees; legacy funding creates unbacked cash.')
 
         const employee = await pool.query(`
-            SELECT "ID" FROM "Users"
-            WHERE "ID"=$1 AND "LocationId"=$2 AND COALESCE("IsActive",true)=true
+            SELECT u."ID"
+            FROM "Users" u
+            INNER JOIN "Roles" r ON r."ID"=u."RoleId"
+            WHERE u."ID"=$1
+              AND u."LocationId"=$2
+              AND COALESCE(u."IsActive",true)=true
+              AND LOWER(BTRIM(r."Name"))='employee'
             LIMIT 1`, [toUserId, locationId])
-        if (!employee.rowCount) return fail(res, 400, 'Receiving employee is not active at this location.')
+        if (!employee.rowCount) return fail(res, 400, 'Choose an active user with the Employee role.')
 
         if (fundingType === 'INITIAL_OPENING') {
             const existingPending = await pool.query(`
@@ -2674,7 +2847,7 @@ router.post('/admin/funding', requirePermission('employeesession.update'), async
 
 // Owner/Admin can edit funding only while it is still Pending.
 // Accepted funding is intentionally immutable for audit integrity.
-router.put('/admin/funding/:id', requirePermission('employeesession.update'), async (req, res) => {
+router.put('/admin/funding/:id', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
 
@@ -2761,7 +2934,7 @@ router.put('/admin/funding/:id', requirePermission('employeesession.update'), as
 })
 
 // Pending funding can be cancelled only before the employee accepts it.
-router.post('/admin/funding/:id/cancel', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/admin/funding/:id/cancel', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
         const locationId = Number(req.body.locationid)
@@ -2786,7 +2959,7 @@ router.post('/admin/funding/:id/cancel', requirePermission('employeesession.upda
 // Employee confirms physical cash created by Owner/Admin.
 // INITIAL_OPENING must be the first session cash activity.
 // BUSINESS_SUPPORT is added as additional cash.
-router.post('/admin/funding/:id/accept', requirePermission('clock.update'), async (req, res) => {
+router.post('/admin/funding/:id/accept', requireModuleAccess('transaction.employee'), async (req, res) => {
     const client = await pool.connect()
     try {
         if (!validId(req.params.id)) return fail(res, 400, 'Invalid funding record.')
@@ -2870,7 +3043,7 @@ router.post('/admin/funding/:id/accept', requirePermission('clock.update'), asyn
     }
 })
 
-router.post('/expense-types', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/expense-types', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
         const locationId = Number(req.body.locationid)
@@ -2886,7 +3059,7 @@ router.post('/expense-types', requirePermission('employeesession.update'), async
     }
 })
 
-router.patch('/expense-types/:id', requirePermission('employeesession.update'), async (req, res) => {
+router.patch('/expense-types/:id', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
         const locationId = Number(req.body.locationid)
@@ -2900,7 +3073,7 @@ router.patch('/expense-types/:id', requirePermission('employeesession.update'), 
     } catch (e) { console.error('Finance expense status:', e); return fail(res, 500, 'Unable to update expense type.') }
 })
 
-router.post('/credit-types', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/credit-types', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
 
@@ -2944,7 +3117,7 @@ router.post('/credit-types', requirePermission('employeesession.update'), async 
     }
 })
 
-router.patch('/credit-types/:id', requirePermission('employeesession.update'), async (req, res) => {
+router.patch('/credit-types/:id', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
         const locationId = Number(req.body.locationid)

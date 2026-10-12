@@ -2,8 +2,9 @@ const express = require('express')
 const router = express.Router()
 
 const { pool } = require('../db')
-const { requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const { isAuditVerificationEnabled } = require('../utils/auditVerification')
+const { emitAppRefresh } = require('../utils/realtime')
 
 // ============================================================
 // CLOCK IN
@@ -12,7 +13,7 @@ const { isAuditVerificationEnabled } = require('../utils/auditVerification')
 
 router.post(
     '/clockin',
-    requirePermission('clock.update'),
+    requireModuleAccess(["clock", "transaction.employee"]),
     async (req, res) => {
         try {
             const {
@@ -99,6 +100,18 @@ router.post(
                     ]
                 )
 
+            // Clock-in INSERT is complete at this point. Notify open Employee Session
+            // views at this location so Online/Offline status updates immediately.
+            emitAppRefresh(
+                result.rows[0].locationId,
+                ['employeeSessions'],
+                'employee-clocked-in',
+                {
+                    sessionId: Number(result.rows[0].id),
+                    employeeId: Number(result.rows[0].userId)
+                }
+            )
+
             return res.status(201).json({
                 success: true,
                 code: 20000,
@@ -142,7 +155,7 @@ router.post(
 
 router.post(
     '/clockout',
-    requirePermission('clock.update'),
+    requireModuleAccess(["clock", "transaction.employee"]),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -289,6 +302,18 @@ router.post(
                 'COMMIT'
             )
 
+            // Notify all open Employee Session views at this location only
+            // after the clock-out transaction has committed successfully.
+            emitAppRefresh(
+                result.rows[0].locationId,
+                ['employeeSessions'],
+                'employee-clocked-out',
+                {
+                    sessionId: Number(result.rows[0].id),
+                    employeeId: Number(result.rows[0].userId)
+                }
+            )
+
             return res.status(200).json({
                 success: true,
                 code: 20000,
@@ -328,7 +353,7 @@ router.post(
 
 router.get(
     '/status/:userid',
-    requirePermission('clock.read'),
+    requireModuleAccess(["clock", "transaction.employee"]),
     async (req, res) => {
         try {
             const userid =
@@ -428,7 +453,7 @@ router.get(
 
 router.get(
     '/employee/:userid',
-    requirePermission('clock.read'),
+    requireModuleAccess(["clock", "transaction.employee"]),
     async (req, res) => {
         try {
             const userid =
@@ -584,7 +609,7 @@ function reportDateFilter(query) {
 // Permission: employeesession.read
 // ============================================================
 
-router.get('/reports/employees', requirePermission('employeesession.read'), async (req, res) => {
+router.get('/reports/employees', requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]), async (req, res) => {
     try {
         const locationid = Number(req.query.locationid)
         const dates = reportDateFilter(req.query)
@@ -667,7 +692,7 @@ router.get('/reports/employees', requirePermission('employeesession.read'), asyn
 
 router.get(
     '/reports/employee/:userid/sessions',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const userid = Number(req.params.userid)
@@ -820,7 +845,7 @@ router.get(
 
 router.get(
     '/reports/session/:sessionid',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const sessionid = Number(req.params.sessionid)
@@ -958,7 +983,7 @@ router.get(
 
 router.get(
     '/reports/session/:sessionid/points',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const sessionid = Number(req.params.sessionid)
@@ -1208,7 +1233,7 @@ router.get(
 
 router.put(
     '/reports/points/:matchid/review',
-    requirePermission('employeesession.update'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const matchid = Number(req.params.matchid)
@@ -1308,7 +1333,7 @@ router.put(
 
 router.get(
     '/reports/session/:sessionid/raffle',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         const sessionid = Number(req.params.sessionid)
         const locationid = Number(req.query.locationid)
@@ -1536,7 +1561,7 @@ router.get(
 
 router.put(
     '/reports/raffle/:raffleid/review',
-    requirePermission('employeesession.update'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const raffleid = Number(req.params.raffleid)
@@ -1648,7 +1673,7 @@ router.put(
 
 router.get(
     '/reports/session/:sessionid/ticket-out',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         const sessionid = Number(req.params.sessionid)
         const locationid = Number(req.query.locationid)
@@ -1848,7 +1873,7 @@ router.get(
 
 router.get(
     '/reports/session/:sessionid/bonus',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         const sessionid = Number(req.params.sessionid)
         const locationid = Number(req.query.locationid)
@@ -2026,7 +2051,7 @@ router.get(
 
 router.put(
     '/reports/bonus/:bonusawardid/review',
-    requirePermission('employeesession.update'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const bonusawardid = Number(req.params.bonusawardid)
@@ -2139,7 +2164,7 @@ router.put(
 
 router.get(
     '/reports/session/:sessionid/lucky-bird',
-    requirePermission('employeesession.read'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         const sessionid = Number(req.params.sessionid)
         const locationid = Number(req.query.locationid)
@@ -2315,7 +2340,7 @@ router.get(
 
 router.put(
     '/reports/lucky-bird/:luckybirdawardid/review',
-    requirePermission('employeesession.update'),
+    requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]),
     async (req, res) => {
         try {
             const luckybirdawardid = Number(req.params.luckybirdawardid)
@@ -2423,7 +2448,7 @@ router.put(
 // Uses the same cash types and America/Chicago point window as finance.
 // No money is written, posted, transferred or recalculated in finance tables.
 // ============================================================
-router.get('/reports/session/:sessionid/shift', requirePermission('employeesession.read'), async (req, res) => {
+router.get('/reports/session/:sessionid/shift', requireModuleAccess(["operations.employee-sessions", "reports.weekly", "transaction.admin"]), async (req, res) => {
     const sessionid = Number(req.params.sessionid)
     const locationid = Number(req.query.locationid)
     if (!Number.isSafeInteger(sessionid) || sessionid <= 0 ||

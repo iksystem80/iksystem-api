@@ -3,9 +3,9 @@ const multer = require('multer')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const { uploadPromotionImage } = require('../services/cloudinaryPromotion')
 const { writePromotionAudit } = require('../services/promotionAudit')
-const { requirePermission } = require('../middleware/auth')
 
 const assetUpload = multer({
   storage: multer.memoryStorage(),
@@ -31,7 +31,7 @@ function companyId(req) {
   return Number(req.authUser?.companyId || 0)
 }
 
-router.get('/list', requirePermission('promotion.template.read'), async (req, res) => {
+router.get('/list', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const generatedOnly =
@@ -96,7 +96,7 @@ router.get('/list', requirePermission('promotion.template.read'), async (req, re
   }
 })
 
-router.get('/detail', requirePermission('promotion.template.read'), async (req, res) => {
+router.get('/detail', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const id = Number(req.query.id)
@@ -152,7 +152,7 @@ router.get('/detail', requirePermission('promotion.template.read'), async (req, 
   }
 })
 
-router.post('/create', requirePermission('promotion.template.create'), async (req, res) => {
+router.post('/create', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const uid = userId(req)
@@ -224,7 +224,7 @@ router.post('/create', requirePermission('promotion.template.create'), async (re
   }
 })
 
-router.put('/update', requirePermission('promotion.template.update'), async (req, res) => {
+router.put('/update', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const uid = userId(req)
@@ -304,7 +304,7 @@ router.put('/update', requirePermission('promotion.template.update'), async (req
   }
 })
 
-router.post('/duplicate', requirePermission('promotion.template.create'), async (req, res) => {
+router.post('/duplicate', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const uid = userId(req)
@@ -406,7 +406,7 @@ router.post('/duplicate', requirePermission('promotion.template.create'), async 
   }
 })
 
-router.delete('/delete', requirePermission('promotion.template.delete'), async (req, res) => {
+router.delete('/delete', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const uid = userId(req)
@@ -470,7 +470,7 @@ router.delete('/delete', requirePermission('promotion.template.delete'), async (
 
 router.post(
   '/upload-asset',
-  requirePermission('promotion.template.update'),
+  requireModuleAccess('promotions.templates'),
   assetUpload.single('file'),
   async (req, res) => {
     try {
@@ -531,7 +531,7 @@ router.post(
   }
 )
 
-router.post('/generate', requirePermission('promotion.template.update'), async (req, res) => {
+router.post('/generate', requireModuleAccess('promotions.templates'), async (req, res) => {
   try {
     const cid = companyId(req)
     const uid = userId(req)

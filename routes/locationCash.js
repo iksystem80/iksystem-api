@@ -2,7 +2,8 @@ const express = require('express')
 const { randomUUID } = require('crypto')
 const router = express.Router()
 const { pool } = require('../db')
-const { authenticate, requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
+const { authenticate } = require('../middleware/auth')
 router.use(authenticate)
 const money = v => /^(?:0|[1-9]\d{0,8})(?:\.\d{1,2})?$/.test(String(v ?? '').trim()) && Number(v) > 0 ? Number(v).toFixed(2) : null
 const id = v => Number.isSafeInteger(Number(v)) && Number(v) > 0
@@ -51,7 +52,7 @@ async function movement(req, res, action) {
         await db.query('COMMIT'); return ok(res, result.data || null, result.message)
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; console.error('Location cash:', e); return fail(res, 500, 'Unable to record cash movement.') } finally { db.release() }
 }
-router.get('/overview', requirePermission('clock.read'), async (req, res) => {
+router.get('/overview', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     try {
         const location = Number(req.query.locationid); if (!(await allowed(pool, req, location))) return fail(res, 403, 'Location access denied.')
         const accounts = await pool.query(`SELECT a."ID" AS id,a."Kind" AS kind,a."UserId" AS "userId",COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Business Bank') AS name,
@@ -78,7 +79,7 @@ router.get('/overview', requirePermission('clock.read'), async (req, res) => {
         return ok(res, { viewerId: Number(req.authUser.id), accounts: accounts.rows, expenseTypes: expenseTypes.rows, people: people.rows, capital: capital.rows, transfers: pending.rows, entries: entries.rows, unlinkedProfit: unlinked.rows[0], pendingEmployeeSupport: funding.rows, pendingEmployeeHandovers: pendingHandovers.rows[0]?.amount || '0.00', lifetime: lifetime.rows[0] })
     } catch (e) { console.error('Cash custody overview:', e); return fail(res, 500, 'Unable to load cash custody overview.') }
 })
-router.post('/initial-capital', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/initial-capital', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!owner(req)) return { status: 403, error: 'Owner role required.' }
     if (!id(req.body.touserid)) return { status: 400, error: 'Choose the receiving Admin.' }
     if (!(await receiver(db, location, Number(req.body.touserid), ['admin', 'system admin']))) return { status: 400, error: 'Select an active Admin at this location.' }
@@ -86,7 +87,7 @@ router.post('/initial-capital', requirePermission('employeesession.update'), (re
     const r = await db.query(`INSERT INTO "LocationCashCapital" ("LocationId","ToAccountId","Amount","Notes","CreatedBy") VALUES ($1,$2,$3,$4,$5) RETURNING "ID" AS id`, [location, a, amount, note(req.body.notes), req.authUser.id])
     return { data: r.rows[0], message: 'Owner capital sent for Admin receipt confirmation.' }
 }))
-router.post('/capital/:id/accept', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/capital/:id/accept', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     const db = await pool.connect(); try {
         const location = Number(req.body.locationid); if (!(await allowed(db, req, location)) || !id(req.params.id)) return fail(res, 403, 'Access denied.')
         if (!['admin', 'system admin'].includes(role(req))) return fail(res, 403, 'Admin role required.')
@@ -102,7 +103,7 @@ router.post('/capital/:id/accept', requirePermission('employeesession.update'), 
         await db.query('COMMIT'); return ok(res, null, 'Initial capital confirmed and added to Admin custody.')
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; console.error('Accept capital:', e); return fail(res, 500, 'Unable to confirm capital.') } finally { db.release() }
 })
-router.post('/capital/:id/cancel', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/capital/:id/cancel', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     const db = await pool.connect(); try {
         const location = Number(req.body.locationid); if (!(await allowed(db, req, location)) || !id(req.params.id)) return fail(res, 403, 'Access denied.')
         await db.query('BEGIN'); await lock(db, location)
@@ -112,7 +113,7 @@ router.post('/capital/:id/cancel', requirePermission('employeesession.update'), 
         await db.query('COMMIT'); return ok(res, null, 'Pending capital cancelled.')
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; return fail(res, 500, 'Unable to cancel pending capital.') } finally { db.release() }
 })
-router.post('/cutover-opening', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/cutover-opening', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!owner(req)) return { status: 403, error: 'Owner role required.' }
     if (req.body.confirm !== 'RECONCILED') return { status: 400, error: 'Confirm reconciled historical cash using RECONCILED.' }
     const kind = String(req.body.kind || '').toUpperCase(); if (!['OWNER', 'ADMIN', 'BANK'].includes(kind)) return { status: 400, error: 'Invalid account type.' }
@@ -125,7 +126,7 @@ router.post('/cutover-opening', requirePermission('employeesession.update'), (re
  LIMIT 1`, [a]); if (existing.rowCount) return { error: 'This account already has ledger activity or pending cash. Reconcile and resolve pending funds before cutover.' }
     await entry(db, location, a, amount, 'CUTOVER_OPENING', req.authUser.id, note(req.body.notes) || 'Verified historical cash brought forward'); return { message: 'Reconciled opening balance saved.' }
 }))
-router.post('/transfer', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/transfer', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     const from = String(req.body.fromkind || '').toUpperCase(), to = String(req.body.tokind || '').toUpperCase()
     if (![['OWNER', 'ADMIN'], ['ADMIN', 'OWNER']].some(([a, b]) => a === from && b === to)) return { status: 400, error: 'Use Owner↔Admin transfer.' }
     if (from === 'OWNER' && !owner(req)) return { status: 403, error: 'Owner role required.' }
@@ -137,7 +138,7 @@ router.post('/transfer', requirePermission('employeesession.update'), (req, res)
     const b = await balance(db, src); if (b.balance - b.reserved < Number(amount)) return { error: 'Insufficient unreserved cash in sender custody.' }
     const t = await db.query(`INSERT INTO "LocationCashTransfers" ("LocationId","FromAccountId","ToAccountId","Amount","Kind","Notes","CreatedBy") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "ID" AS id`, [location, src, dst, amount, `${from}_TO_${to}`, note(req.body.notes), req.authUser.id]); return { data: t.rows[0], message: 'Transfer pending receiver confirmation.' }
 }))
-router.post('/transfers/:id/accept', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/transfers/:id/accept', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     const db = await pool.connect(); try {
         const location = Number(req.body.locationid); if (!(await allowed(db, req, location)) || !id(req.params.id)) return fail(res, 403, 'Access denied.')
         await db.query('BEGIN'); await lock(db, location)
@@ -148,23 +149,23 @@ router.post('/transfers/:id/accept', requirePermission('employeesession.update')
         await entry(db, location, t.FromAccountId, -Number(t.Amount), 'TRANSFER', req.authUser.id, `Transfer #${t.ID}`, { transferId: t.ID }); await entry(db, location, t.ToAccountId, t.Amount, 'TRANSFER', req.authUser.id, `Transfer #${t.ID}`, { transferId: t.ID }); await db.query(`UPDATE "LocationCashTransfers" SET "Status"='Accepted',"AcceptedBy"=$2,"AcceptedAt"=NOW() WHERE "ID"=$1`, [t.ID, req.authUser.id]); await db.query('COMMIT'); return ok(res, null, 'Cash receipt confirmed.')
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; console.error('Cash transfer accept:', e); return fail(res, 500, 'Unable to confirm transfer.') } finally { db.release() }
 })
-router.post('/transfers/:id/cancel', requirePermission('employeesession.update'), async (req, res) => {
+router.post('/transfers/:id/cancel', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     const db = await pool.connect(); try {
         const location = Number(req.body.locationid); if (!(await allowed(db, req, location)) || !id(req.params.id)) return fail(res, 403, 'Access denied.'); await db.query('BEGIN'); await lock(db, location)
         const r = await db.query(`UPDATE "LocationCashTransfers" SET "Status"='Cancelled',"CancelledBy"=$3,"CancelledAt"=NOW() WHERE "ID"=$1 AND "LocationId"=$2 AND "Status"='Pending' AND "CreatedBy"=$3 RETURNING "ID"`, [req.params.id, location, req.authUser.id]); if (!r.rowCount) { await db.query('ROLLBACK'); return fail(res, 409, 'Only the initiator can cancel a pending transfer.') } await db.query('COMMIT'); return ok(res, null, 'Transfer cancelled.')
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; return fail(res, 500, 'Unable to cancel transfer.') } finally { db.release() }
 })
-router.post('/bank-deposit', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/bank-deposit', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!owner(req)) return { status: 403, error: 'Owner role required.' }
     const src = await account(db, location, 'OWNER', req.authUser.id), dst = await account(db, location, 'BANK', null), b = await balance(db, src); if (b.balance - b.reserved < Number(amount)) return { error: 'Owner has insufficient available cash.' }
     const movementKey = randomUUID(); await entry(db, location, src, -Number(amount), 'BANK_DEPOSIT', req.authUser.id, note(req.body.notes), { movementKey }); await entry(db, location, dst, amount, 'BANK_DEPOSIT', req.authUser.id, note(req.body.notes), { movementKey }); return { message: 'Cash deposited to business bank ledger.' }
 }))
-router.post('/bank-withdrawal', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/bank-withdrawal', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!owner(req)) return { status: 403, error: 'Owner role required.' }
     const src = await account(db, location, 'BANK', null), dst = await account(db, location, 'OWNER', req.authUser.id), b = await balance(db, src); if (b.balance - b.reserved < Number(amount)) return { error: 'Insufficient business bank ledger balance.' }
     const movementKey = randomUUID(); await entry(db, location, src, -Number(amount), 'BANK_WITHDRAWAL', req.authUser.id, note(req.body.notes), { movementKey }); await entry(db, location, dst, amount, 'BANK_WITHDRAWAL', req.authUser.id, note(req.body.notes), { movementKey }); return { message: 'Bank cash moved into Owner custody.' }
 }))
-router.post('/expense', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/expense', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     const source = String(req.body.source || '').toUpperCase()
     if (!['OWNER', 'ADMIN', 'BANK'].includes(source)) return { status: 400, error: 'Choose an expense source.' }
     if (source === 'OWNER' && !owner(req)) return { status: 403, error: 'Owner role required.' }
@@ -178,22 +179,22 @@ router.post('/expense', requirePermission('employeesession.update'), (req, res) 
         `${type.rows[0].Name}${note(req.body.notes) ? ' · ' + note(req.body.notes) : ''}`, { expenseTypeId: Number(req.body.expensetypeid) })
     return { message: 'Direct business expense posted to custody and operating activity.' }
 }))
-router.post('/owner-distribution', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/owner-distribution', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!owner(req)) return { status: 403, error: 'Owner role required.' }
     const kind = String(req.body.source || 'OWNER').toUpperCase(); if (!['OWNER', 'BANK'].includes(kind)) return { status: 400, error: 'Choose Owner cash or Bank.' }
     const src = await account(db, location, kind, kind === 'OWNER' ? req.authUser.id : null), b = await balance(db, src); if (b.balance - b.reserved < Number(amount)) return { error: 'Insufficient available funds.' }
     await entry(db, location, src, -Number(amount), 'OWNER_DISTRIBUTION', req.authUser.id, note(req.body.notes) || 'Owner distribution'); return { message: 'Owner distribution recorded; funds left the business.' }
 }))
-router.post('/employee-support', requirePermission('employeesession.update'), (req, res) => movement(req, res, async (db, location, amount) => {
+router.post('/employee-support', requireModuleAccess(["transaction.admin", "reports.weekly"]), (req, res) => movement(req, res, async (db, location, amount) => {
     if (!['admin', 'system admin'].includes(role(req))) return { status: 403, error: 'Admin role required.' }
     const user = Number(req.body.touserid); if (!id(user)) return { status: 400, error: 'Select receiving employee.' }
-    const roleRow = await db.query(`SELECT LOWER(BTRIM(r."Name")) AS role FROM "Users" u JOIN "Roles" r ON r."ID"=u."RoleId" WHERE u."ID"=$1 AND u."LocationId"=$2 AND COALESCE(u."IsActive",true)=true`, [user, location]); if (!roleRow.rowCount || ['owner', 'admin', 'system admin'].includes(roleRow.rows[0].role)) return { status: 400, error: 'Choose an active employee (not Owner/Admin).' }
+    const roleRow = await db.query(`SELECT LOWER(BTRIM(r."Name")) AS role FROM "Users" u JOIN "Roles" r ON r."ID"=u."RoleId" WHERE u."ID"=$1 AND u."LocationId"=$2 AND COALESCE(u."IsActive",true)=true`, [user, location]); if (!roleRow.rowCount || roleRow.rows[0].role !== 'employee') return { status: 400, error: 'Choose an active user with the Employee role.' }
     const src = await account(db, location, 'ADMIN', req.authUser.id), b = await balance(db, src); if (b.balance - b.reserved < Number(amount)) return { error: 'Insufficient unreserved Admin cash.' }
     const funding = await db.query(`INSERT INTO "AdminCashFunding" ("LocationId","FromUserId","ToUserId","FundingType","Amount","Notes","CustodySourceAccountId") VALUES ($1,$2,$3,'BUSINESS_SUPPORT',$4,$5,$6) RETURNING "ID" AS id`, [location, req.authUser.id, user, amount, note(req.body.notes), src]); return { data: funding.rows[0], message: 'Employee support pending confirmation; Admin funds reserved.' }
 }))
 // Read-only: positive machine-reading cash actually credited to the signed-in Admin custody.
 // All-time summary is calculated separately from the capped recent list.
-router.get('/machine-collections', requirePermission('clock.read'), async (req, res) => {
+router.get('/machine-collections', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     try {
         const location = Number(req.query.locationid)
         if (!(await allowed(pool, req, location))) return fail(res, 403, 'Location access denied.')

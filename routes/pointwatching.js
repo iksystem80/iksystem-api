@@ -3,7 +3,7 @@ const express = require('express')
 const router = express.Router()
 
 const { pool } = require('../db')
-const { requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 
 /*
 ====================================================
@@ -14,7 +14,7 @@ Permission: pointwatching.read
 
 router.get(
     '/employees',
-    requirePermission('pointwatching.read'),
+    requireModuleAccess('operations.pointwatching'),
     async (req, res) => {
         try {
             const locationId =
@@ -102,7 +102,7 @@ Permission: pointwatching.read
 
 router.get(
     '/by-date',
-    requirePermission('pointwatching.read'),
+    requireModuleAccess('operations.pointwatching'),
     async (req, res) => {
         try {
             const locationId =
@@ -272,7 +272,7 @@ Permission: pointwatching.read
 
 router.get(
     '/by-employee/:employeeId',
-    requirePermission('pointwatching.read'),
+    requireModuleAccess('operations.pointwatching'),
     async (req, res) => {
         try {
             const employeeId =
@@ -642,7 +642,7 @@ router.get(
 
 router.get(
     '/session/:sessionId/entries',
-    requirePermission('pointwatching.read'),
+    requireModuleAccess('operations.pointwatching'),
     async (req, res) => {
         try {
             const sessionId =

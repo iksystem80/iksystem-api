@@ -3,8 +3,8 @@ const multer = require('multer')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const cloudinary = require('../config/cloudinary')
-const { requirePermission } = require('../middleware/auth')
 
 const luckyBirdUpload = multer({
     storage: multer.memoryStorage(),
@@ -56,6 +56,75 @@ async function activeEmployeeSession(db, req, lock = false) {
     `, [userId])
 
     return result.rows[0] || null
+}
+
+async function luckyBirdRuleState(db, locationId, lock = false) {
+    await db.query(`
+        INSERT INTO "LocationRuleSettings" ("LocationId")
+        VALUES ($1)
+        ON CONFLICT ("LocationId") DO NOTHING
+    `, [locationId])
+
+    const ruleResult = await db.query(`
+        SELECT
+            COALESCE("LuckyBirdEnabled", false) AS "enabled",
+            GREATEST(COALESCE("LuckyBirdMaxCustomersPerDay", 0), 0)::integer AS "dailyLimit"
+        FROM "LocationRuleSettings"
+        WHERE "LocationId"=$1
+        LIMIT 1
+        ${lock ? 'FOR UPDATE' : ''}
+    `, [locationId])
+
+    const usageResult = await db.query(`
+        WITH local_clock AS (
+            SELECT CURRENT_TIMESTAMP AT TIME ZONE 'America/Chicago' AS local_now
+        ),
+        bounds AS (
+            SELECT
+                CASE
+                    WHEN local_now::time >= TIME '06:00' THEN local_now::date
+                    ELSE local_now::date - 1
+                END AS business_date
+            FROM local_clock
+        )
+        SELECT
+            COUNT(lb."ID")::integer AS "used",
+            ((b.business_date::timestamp + INTERVAL '6 hours') AT TIME ZONE 'America/Chicago') AS "startsAt",
+            (((b.business_date + 1)::timestamp + INTERVAL '6 hours') AT TIME ZONE 'America/Chicago') AS "endsAt"
+        FROM bounds b
+        LEFT JOIN "LuckyBirdAwards" lb
+          ON lb."LocationId"=$1
+         AND lb."CreatedAt" >= ((b.business_date::timestamp + INTERVAL '6 hours') AT TIME ZONE 'America/Chicago')
+         AND lb."CreatedAt" < (((b.business_date + 1)::timestamp + INTERVAL '6 hours') AT TIME ZONE 'America/Chicago')
+        GROUP BY b.business_date
+    `, [locationId])
+
+    const rule = ruleResult.rows[0] || {}
+    const usage = usageResult.rows[0] || {}
+    const dailyLimit = Number(rule.dailyLimit || 0)
+    const used = Number(usage.used || 0)
+
+    return {
+        enabled: rule.enabled === true,
+        dailyLimit,
+        used,
+        remaining: Math.max(dailyLimit - used, 0),
+        dayStart: '06:00',
+        startsAt: usage.startsAt || null,
+        endsAt: usage.endsAt || null
+    }
+}
+
+function luckyBirdRuleFailure(res, rule) {
+    if (!rule.enabled) {
+        return fail(res, 403, 'Lucky Bird is disabled by the administrator for this location.')
+    }
+
+    if (rule.dailyLimit <= 0 || rule.remaining <= 0) {
+        return fail(res, 409, 'The daily Lucky Bird customer limit has been reached. The limit resets at 6:00 AM.')
+    }
+
+    return null
 }
 
 async function sessionBalance(db, session) {
@@ -128,7 +197,7 @@ async function sessionBalance(db, session) {
 
 router.get(
     '/give/state',
-    requirePermission('clock.read'),
+    requireModuleAccess('luckybird'),
     async (req, res) => {
         try {
             const session = await activeEmployeeSession(pool, req)
@@ -137,13 +206,23 @@ router.get(
                 return fail(res, 409, 'Clock in before giving a Lucky Bird.')
             }
 
-            const balance = await sessionBalance(pool, session)
+            const [balance, luckyBirdRule] = await Promise.all([
+                sessionBalance(pool, session),
+                luckyBirdRuleState(pool, session.LocationId)
+            ])
 
             return ok(res, {
                 sessionId: session.ID,
                 locationId: session.LocationId,
                 balance: Number(balance.balance || 0),
-                cashReady: Number(balance.entries || 0) > 0
+                cashReady: Number(balance.entries || 0) > 0,
+                luckyBirdEnabled: luckyBirdRule.enabled,
+                luckyBirdDailyLimit: luckyBirdRule.dailyLimit,
+                luckyBirdUsedToday: luckyBirdRule.used,
+                luckyBirdRemainingToday: luckyBirdRule.remaining,
+                luckyBirdDayStart: luckyBirdRule.dayStart,
+                luckyBirdDayStartsAt: luckyBirdRule.startsAt,
+                luckyBirdDayEndsAt: luckyBirdRule.endsAt
             })
         } catch (error) {
             console.error('Lucky Bird state:', error)
@@ -158,7 +237,7 @@ router.get(
 
 router.get(
     '/give/machine',
-    requirePermission('clock.read'),
+    requireModuleAccess('luckybird'),
     async (req, res) => {
         try {
             const session = await activeEmployeeSession(pool, req)
@@ -166,6 +245,10 @@ router.get(
             if (!session) {
                 return fail(res, 409, 'Clock in before giving a Lucky Bird.')
             }
+
+            const luckyBirdRule = await luckyBirdRuleState(pool, session.LocationId)
+            const ruleFailure = luckyBirdRuleFailure(res, luckyBirdRule)
+            if (ruleFailure) return ruleFailure
 
             const machineNumber = String(req.query.machinenumber || '').trim()
 
@@ -212,7 +295,7 @@ router.get(
 
 router.post(
     '/give/save',
-    requirePermission('clock.update'),
+    requireModuleAccess('luckybird'),
     luckyBirdUpload.single('image'),
     async (req, res) => {
         const client = await pool.connect()
@@ -245,6 +328,18 @@ router.post(
             if (!session) {
                 await client.query('ROLLBACK')
                 return fail(res, 409, 'Clock in before giving a Lucky Bird.')
+            }
+
+            const luckyBirdRule = await luckyBirdRuleState(client, session.LocationId, true)
+
+            if (!luckyBirdRule.enabled) {
+                await client.query('ROLLBACK')
+                return fail(res, 403, 'Lucky Bird is disabled by the administrator for this location.')
+            }
+
+            if (luckyBirdRule.dailyLimit <= 0 || luckyBirdRule.remaining <= 0) {
+                await client.query('ROLLBACK')
+                return fail(res, 409, 'The daily Lucky Bird customer limit has been reached. The limit resets at 6:00 AM.')
             }
 
             const machine = await client.query(`
@@ -353,7 +448,10 @@ router.post(
                     customerId,
                     customerName,
                     amount,
-                    imageUrl: image.secure_url
+                    imageUrl: image.secure_url,
+                    luckyBirdDailyLimit: luckyBirdRule.dailyLimit,
+                    luckyBirdUsedToday: luckyBirdRule.used + 1,
+                    luckyBirdRemainingToday: Math.max(luckyBirdRule.remaining - 1, 0)
                 },
                 'Lucky Bird saved and deducted from your employee session.'
             )

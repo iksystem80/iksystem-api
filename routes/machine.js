@@ -1,11 +1,9 @@
 const express = require('express')
 const router = express.Router()
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 
-const {
-    authenticate,
-    requirePermission
-} = require('../middleware/auth')
+const { authenticate } = require('../middleware/auth')
 
 router.use(authenticate)
 
@@ -56,7 +54,7 @@ async function verifyLocation(req, locationId, client = pool) {
 
 router.get(
     '/getmachinebynumber',
-    requirePermission('machines.read'),
+    requireModuleAccess(["settings.machines", "reading.record", "customers", "checkin"]),
     async (req, res) => {
         try {
             const {
@@ -241,7 +239,7 @@ function errorResponse(res, error) {
 
 router.get(
     '/statuses',
-    requirePermission('machines.read'),
+    requireModuleAccess(["settings.machines", "reading.record", "customers", "checkin"]),
     async (_req, res) => {
         try {
             const result = await pool.query(`
@@ -267,7 +265,7 @@ router.get(
 
 router.get(
     '/getall',
-    requirePermission('machines.read'),
+    requireModuleAccess(["settings.machines", "reading.record", "customers", "checkin"]),
     async (req, res) => {
         try {
             const locationId = Number(req.query.locationid)
@@ -335,7 +333,7 @@ router.get(
 
 router.post(
     '/generate',
-    requirePermission('machines.create'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         const client = await pool.connect()
@@ -504,7 +502,7 @@ router.post(
 
 router.put(
     '/update/:id',
-    requirePermission('machines.update'),
+    requireModuleAccess(["settings.machines", "reading.record"]),
     requireOwnerOrAdmin,
     async (req, res) => {
         const client = await pool.connect()
@@ -723,7 +721,7 @@ router.put(
 
 router.get(
     '/logs/:machineId',
-    requirePermission('machines.read'),
+    requireModuleAccess(["settings.machines", "reading.record", "customers", "checkin"]),
     async (req, res) => {
         try {
             const machineId = Number(req.params.machineId)
@@ -764,7 +762,7 @@ router.get(
 
 router.get(
     '/types',
-    requirePermission('machinetypes.read'),
+    requireModuleAccess('settings.machines'),
     async (req, res) => {
         try {
             const result = await pool.query(`
@@ -791,7 +789,7 @@ router.get(
 
 router.post(
     '/types',
-    requirePermission('machinetypes.create'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -839,7 +837,7 @@ router.post(
 
 router.put(
     '/types/:id',
-    requirePermission('machinetypes.update'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -883,7 +881,7 @@ router.put(
 
 router.delete(
     '/types/:id',
-    requirePermission('machinetypes.delete'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -943,7 +941,7 @@ router.delete(
 
 router.get(
     '/games',
-    requirePermission('games.read'),
+    requireModuleAccess('settings.machines'),
     async (req, res) => {
         try {
             const { machineTypeId } = req.query
@@ -987,7 +985,7 @@ router.get(
 
 router.post(
     '/games',
-    requirePermission('games.create'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -1050,7 +1048,7 @@ router.post(
 
 router.put(
     '/games/:id',
-    requirePermission('games.update'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -1126,7 +1124,7 @@ router.put(
 
 router.delete(
     '/games/:id',
-    requirePermission('games.delete'),
+    requireModuleAccess('settings.machines'),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -1189,7 +1187,7 @@ router.delete(
 
 router.get(
     '/initial-readings',
-    requirePermission('machines.read'),
+    requireModuleAccess(["settings.machines", "reading.record", "customers", "checkin"]),
     async (req, res) => {
         try {
             const locationId =
@@ -1281,7 +1279,7 @@ router.get(
 
 router.put(
     '/initial-readings/:machineId',
-    requirePermission('machines.update'),
+    requireModuleAccess(["settings.machines", "reading.record"]),
     requireOwnerOrAdmin,
     async (req, res) => {
         const client =
@@ -1478,7 +1476,7 @@ router.put(
 
 router.delete(
     '/initial-readings/:machineId',
-    requirePermission('machines.update'),
+    requireModuleAccess(["settings.machines", "reading.record"]),
     requireOwnerOrAdmin,
     async (req, res) => {
         try {
@@ -1568,7 +1566,7 @@ router.delete(
 
 router.patch(
     '/deactivate/:machineId',
-    requirePermission('machines.update'),
+    requireModuleAccess(["settings.machines", "reading.record"]),
     requireOwnerOrAdmin,
     async (req, res) => {
         const client =

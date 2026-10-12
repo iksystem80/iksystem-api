@@ -5,11 +5,9 @@ const crypto = require('crypto')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 
-const {
-    authenticate,
-    requirePermission
-} = require('../middleware/auth')
+const { authenticate } = require('../middleware/auth')
 
 router.use(authenticate)
 
@@ -283,7 +281,7 @@ async function verifyRoleAssignment(
 
 router.get(
     '/getall',
-    requirePermission('users.read'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         try {
             const {
@@ -390,7 +388,7 @@ router.get(
 
 router.get(
     '/get/:id',
-    requirePermission('users.read'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         try {
             const userId =
@@ -490,7 +488,7 @@ router.get(
 
 router.post(
     '/saveemployee',
-    requirePermission('users.create'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         try {
             const {
@@ -701,7 +699,7 @@ router.post(
 
 router.put(
     '/update/:id',
-    requirePermission('users.update'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -998,7 +996,7 @@ router.put(
 
 router.patch(
     '/status/:id',
-    requirePermission('users.update'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         try {
             const userId =
@@ -1121,7 +1119,7 @@ router.patch(
 
 router.delete(
     '/delete',
-    requirePermission('users.delete'),
+    requireModuleAccess('settings.users'),
     async (req, res) => {
         try {
             const {

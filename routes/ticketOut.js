@@ -1,8 +1,9 @@
 const express = require('express')
 const multer = require('multer')
 const { pool } = require('../db')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const cloudinary = require('../config/cloudinary')
-const { authenticate, requirePermission } = require('../middleware/auth')
+const { authenticate } = require('../middleware/auth')
 
 const router = express.Router()
 router.use(authenticate)
@@ -100,7 +101,7 @@ async function sessionBalance(db, session) {
     return result.rows[0]
 }
 
-router.get('/state', requirePermission('clock.read'), async (req, res) => {
+router.get('/state', requireModuleAccess('ticketout'), async (req, res) => {
     try {
         const session = await activeSession(pool, req)
 
@@ -122,7 +123,7 @@ router.get('/state', requirePermission('clock.read'), async (req, res) => {
     }
 })
 
-router.get('/machine', requirePermission('clock.read'), async (req, res) => {
+router.get('/machine', requireModuleAccess('ticketout'), async (req, res) => {
     try {
         const session = await activeSession(pool, req)
 
@@ -163,7 +164,7 @@ router.get('/machine', requirePermission('clock.read'), async (req, res) => {
 
 router.post(
     '/save',
-    requirePermission('clock.update'),
+    requireModuleAccess('ticketout'),
     upload.single('image'),
     async (req, res) => {
         const client = await pool.connect()
@@ -302,7 +303,7 @@ router.post(
     }
 )
 
-router.get('/recent', requirePermission('clock.read'), async (req, res) => {
+router.get('/recent', requireModuleAccess('ticketout'), async (req, res) => {
     try {
         const session = await activeSession(pool, req)
 

@@ -1,6 +1,6 @@
 const express = require('express')
 const { pool } = require('../db')
-const { requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 const {
     sendCode,
     verifyCode
@@ -39,7 +39,7 @@ async function getCustomer(customerId) {
 
 router.post(
     '/send',
-    requirePermission('customers.create'),
+    requireModuleAccess('customers'),
     async (req, res) => {
         try {
             const customerId =
@@ -121,7 +121,7 @@ router.post(
 
 router.post(
     '/verify',
-    requirePermission('customers.create'),
+    requireModuleAccess('customers'),
     async (req, res) => {
         let dbClient = null
 
@@ -297,7 +297,7 @@ router.post(
 
 router.post(
     '/bypass',
-    requirePermission('customers.create'),
+    requireModuleAccess('customers'),
     async (req, res) => {
         try {
             const customerId =

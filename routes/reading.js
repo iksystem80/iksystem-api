@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 
 const { pool } = require('../db')
-const { requirePermission } = require('../middleware/auth')
+const { requireModuleAccess } = require('../utils/moduleAccess')
 
 // ============================================================
 // HELPERS
@@ -35,7 +35,7 @@ function errorResponse(
 // ============================================================
 // Returns completed, unassigned employee sessions plus those already attached
 // to this OPEN reading session. The server always rechecks on write.
-router.get('/employee-sessions', requirePermission('reading.read'), async (req, res) => {
+router.get('/employee-sessions', requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]), async (req, res) => {
     try {
         const locationId = Number(req.query.locationid)
         const sessionId = Number(req.query.sessionid)
@@ -66,7 +66,7 @@ router.get('/employee-sessions', requirePermission('reading.read'), async (req, 
     }
 })
 
-router.put('/employee-sessions', requirePermission('reading.update'), async (req, res) => {
+router.put('/employee-sessions', requireModuleAccess(["reading.record", "reading.reports"]), async (req, res) => {
     const locationId = Number(req.body.locationid)
     const sessionId = Number(req.body.sessionid)
     const ids = req.body.employeesessionids
@@ -127,7 +127,7 @@ router.put('/employee-sessions', requirePermission('reading.update'), async (req
 
 router.post(
     '/startnewsession',
-    requirePermission('reading.create'),
+    requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
         try {
             const {
@@ -207,7 +207,7 @@ router.post(
 
 router.get(
     '/getactivesession',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const {
@@ -311,7 +311,7 @@ router.get(
 
 router.get(
     '/previousreading',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const {
@@ -450,7 +450,7 @@ router.get(
 
 router.post(
     '/savereading',
-    requirePermission('reading.create'),
+    requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -834,7 +834,7 @@ router.post(
 
 router.get(
     '/getreadings',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const {
@@ -944,7 +944,7 @@ router.get(
 
 router.put(
     '/endsession',
-    requirePermission('reading.update'),
+    requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
         const client = await pool.connect()
 
@@ -1149,7 +1149,7 @@ router.put(
 
 router.delete(
     '/deletesession',
-    requirePermission('reading.delete'),
+    requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
         const client =
             await pool.connect()
@@ -1300,7 +1300,7 @@ router.delete(
 
 router.delete(
     '/deletereading',
-    requirePermission('reading.delete'),
+    requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
         try {
             const {
@@ -1390,7 +1390,7 @@ router.delete(
 
 router.get(
     '/completedsessions',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const { locationid } = req.query
@@ -1475,7 +1475,7 @@ router.get(
 
 router.get(
     '/sessionreport',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const {
@@ -1875,7 +1875,7 @@ function weeklyReportNumber(value) {
 
 router.get(
     '/weeklyreport/week',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const locationId = Number(req.query.locationid)
@@ -1947,7 +1947,7 @@ router.get(
 
 router.get(
     '/weeklyreport/day',
-    requirePermission('reading.read'),
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
     async (req, res) => {
         try {
             const locationId = Number(req.query.locationid)
@@ -2746,7 +2746,10 @@ router.get(
             const baseEndingBalance = weeklyReportNumber(cashMeta.endingBalance)
             const endingBalance = baseEndingBalance + adminCredits - adminExpenses
 
-            const totalIn = openingBalance + readingTotals.totalIn + employeeShortPayment + adminCredits
+            // Money In reflects only the Reading Session opening balance + meter Daily IN.
+            // Employee Short Payment and Admin Reading Credits affect custody / ending balance,
+            // but they are not Reading Session Money In.
+            const totalIn = openingBalance + readingTotals.totalIn
             const totalOut = readingTotals.totalOut + allExpenses
             const difference = totalIn - totalOut
             const shortOver = endingBalance - difference
