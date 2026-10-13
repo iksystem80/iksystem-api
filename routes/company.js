@@ -5,6 +5,10 @@ const crypto = require('crypto')
 const router = express.Router()
 
 const { pool } = require('../db')
+const {
+    emitAccessStatus,
+    emitLocationsRefresh
+} = require('../utils/realtime')
 
 const {
     authenticate,
@@ -37,6 +41,9 @@ router.get(
 
                         c."IsActive"
                             AS "isActive",
+
+                        c."IsSuspended"
+                            AS "isSuspended",
 
                         c."DateCreated"
                             AS "dateCreated",
@@ -73,6 +80,7 @@ router.get(
                         c."Name",
                         c."Code",
                         c."IsActive",
+                        c."IsSuspended",
                         c."DateCreated"
 
                     ORDER BY
@@ -133,6 +141,9 @@ router.get(
 
                         "IsActive"
                             AS "isActive",
+
+                        "IsSuspended"
+                            AS "isSuspended",
 
                         "DateCreated"
                             AS "dateCreated"
@@ -355,6 +366,7 @@ router.post(
                         "Name",
                         "Code",
                         "IsActive",
+                        "IsSuspended",
                         "DateCreated"
                     )
 
@@ -363,6 +375,7 @@ router.post(
                         $1,
                         $2,
                         true,
+                        false,
                         NOW()
                     )
 
@@ -539,8 +552,50 @@ router.put(
             const {
                 name,
                 code,
-                isActive
+                isActive,
+                isSuspended,
+                status
             } = req.body
+
+            let nextIsActive =
+                isActive !== false
+
+            let nextIsSuspended =
+                Boolean(isSuspended)
+
+            if (status) {
+                const normalizedStatus =
+                    String(status)
+                        .trim()
+                        .toLowerCase()
+
+                if (
+                    ![
+                        'active',
+                        'inactive',
+                        'suspended'
+                    ].includes(normalizedStatus)
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message:
+                            'Company status is invalid.'
+                    })
+                }
+
+                nextIsActive =
+                    normalizedStatus ===
+                    'active'
+
+                nextIsSuspended =
+                    normalizedStatus ===
+                    'suspended'
+            }
+
+            if (nextIsActive) {
+                nextIsSuspended = false
+            }
 
             const result =
                 await pool.query(
@@ -552,18 +607,23 @@ router.put(
                         "Name" = $1,
                         "Code" = $2,
                         "IsActive" = $3,
+                        "IsSuspended" = $4,
                         "DateUpdated" = NOW()
 
                     WHERE
-                        "ID" = $4
+                        "ID" = $5
 
                     RETURNING
-                        "ID"
+                        "ID" AS "id",
+                        "Name" AS "name",
+                        "IsActive" AS "isActive",
+                        "IsSuspended" AS "isSuspended"
                     `,
                     [
                         name,
                         code || null,
-                        isActive !== false,
+                        nextIsActive,
+                        nextIsSuspended,
                         companyId
                     ]
                 )
@@ -577,6 +637,36 @@ router.put(
                     message:
                         'Company not found.'
                 })
+            }
+
+            const updatedCompany =
+                result.rows[0]
+
+            const updatedStatus =
+                updatedCompany.isSuspended
+                    ? 'suspended'
+                    : updatedCompany.isActive
+                        ? 'active'
+                        : 'inactive'
+
+            if (
+                updatedStatus === 'inactive' ||
+                updatedStatus === 'suspended'
+            ) {
+                emitAccessStatus(
+                    'company',
+                    companyId,
+                    updatedStatus,
+                    updatedCompany.name
+                )
+            } else {
+                emitLocationsRefresh(
+                    companyId,
+                    'company-activated',
+                    {
+                        companyId
+                    }
+                )
             }
 
             return res.status(200).json({
@@ -618,25 +708,114 @@ router.patch(
                 )
 
             const {
-                isActive
+                isActive,
+                status
             } = req.body
 
-            await pool.query(
-                `
-                UPDATE "Companies"
+            let nextIsActive
+            let nextIsSuspended
 
-                SET
-                    "IsActive" = $1,
-                    "DateUpdated" = NOW()
+            if (status) {
+                const normalizedStatus =
+                    String(status)
+                        .trim()
+                        .toLowerCase()
 
-                WHERE
-                    "ID" = $2
-                `,
-                [
-                    Boolean(isActive),
-                    companyId
-                ]
-            )
+                if (
+                    ![
+                        'active',
+                        'inactive',
+                        'suspended'
+                    ].includes(normalizedStatus)
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message:
+                            'Company status is invalid.'
+                    })
+                }
+
+                nextIsActive =
+                    normalizedStatus ===
+                    'active'
+
+                nextIsSuspended =
+                    normalizedStatus ===
+                    'suspended'
+            } else {
+                // Backward compatible with the existing frontend/API helper.
+                nextIsActive =
+                    Boolean(isActive)
+
+                nextIsSuspended =
+                    false
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE "Companies"
+
+                    SET
+                        "IsActive" = $1,
+                        "IsSuspended" = $2,
+                        "DateUpdated" = NOW()
+
+                    WHERE
+                        "ID" = $3
+
+                    RETURNING
+                        "ID" AS "id",
+                        "Name" AS "name",
+                        "IsActive" AS "isActive",
+                        "IsSuspended" AS "isSuspended"
+                    `,
+                    [
+                        nextIsActive,
+                        nextIsSuspended,
+                        companyId
+                    ]
+                )
+
+            if (!result.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message:
+                        'Company not found.'
+                })
+            }
+
+            const updatedCompany =
+                result.rows[0]
+
+            const updatedStatus =
+                updatedCompany.isSuspended
+                    ? 'suspended'
+                    : updatedCompany.isActive
+                        ? 'active'
+                        : 'inactive'
+
+            if (
+                updatedStatus === 'inactive' ||
+                updatedStatus === 'suspended'
+            ) {
+                emitAccessStatus(
+                    'company',
+                    companyId,
+                    updatedStatus,
+                    updatedCompany.name
+                )
+            } else {
+                emitLocationsRefresh(
+                    companyId,
+                    'company-activated',
+                    {
+                        companyId
+                    }
+                )
+            }
 
             return res.status(200).json({
                 success: true,

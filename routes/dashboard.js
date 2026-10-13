@@ -785,4 +785,177 @@ router.get(
 )
 
 
+// ============================================================
+// ACTIVE EMPLOYEE SESSIONS
+// Admin dashboard: current clocked-in employees + live balance
+// ============================================================
+
+router.get(
+    '/active-employee-sessions',
+    authenticate,
+    async (req, res) => {
+        try {
+            const locationId = Number(req.query.locationid)
+            const roleName = normalizeRoleName(req.authUser?.roleName)
+
+            if (!Number.isInteger(locationId) || locationId <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Valid location id is required.',
+                    code: 40000
+                })
+            }
+
+            if (!['owner', 'admin', 'system admin'].includes(roleName)) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Admin dashboard access is required.',
+                    code: 40300
+                })
+            }
+
+            const locationResult = await pool.query(
+                `SELECT "ID", "CompanyId" FROM "Locations" WHERE "ID"=$1 LIMIT 1`,
+                [locationId]
+            )
+
+            if (!locationResult.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Location not found.',
+                    code: 40400
+                })
+            }
+
+            if (roleName !== 'system admin') {
+                if (Number(locationResult.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                    return res.status(403).json({
+                        success: false,
+                        message: 'You do not have access to this location.',
+                        code: 40300
+                    })
+                }
+
+                if (roleName === 'admin' && Number(req.authUser?.locationId) !== locationId) {
+                    const access = await pool.query(
+                        `SELECT 1
+                         FROM "UserLocationAccess"
+                         WHERE "UserId"=$1 AND "LocationId"=$2
+                         LIMIT 1`,
+                        [Number(req.authUser.id), locationId]
+                    )
+
+                    if (!access.rowCount) {
+                        return res.status(403).json({
+                            success: false,
+                            message: 'You do not have access to this location.',
+                            code: 40300
+                        })
+                    }
+                }
+            }
+
+            const result = await pool.query(
+                `
+                WITH active_sessions AS (
+                    SELECT
+                        es."ID" AS "sessionId",
+                        es."UserId" AS "userId",
+                        es."LocationId" AS "locationId",
+                        es."ClockIn" AS "clockIn",
+                        u."Name" AS "name",
+                        u."Username" AS "username",
+                        u."Avatar" AS "avatar",
+                        u."JobTitle" AS "jobTitle"
+                    FROM "EmployeeSession" es
+                    JOIN "Users" u ON u."ID"=es."UserId"
+                    JOIN "Roles" r ON r."ID"=u."RoleId"
+                    WHERE es."LocationId"=$1
+                      AND es."ClockOut" IS NULL
+                      AND COALESCE(u."IsActive",true)=true
+                      AND LOWER(BTRIM(r."Name"))='employee'
+                )
+                SELECT
+                    s."sessionId",
+                    s."userId",
+                    s."clockIn",
+                    COALESCE(NULLIF(BTRIM(s."name"),''),s."username",'Employee') AS "name",
+                    s."avatar",
+                    s."jobTitle",
+                    ROUND((EXTRACT(EPOCH FROM (NOW()-s."clockIn"))/60)::numeric,0)::integer AS "elapsedMinutes",
+                    (cash.opening + cash.received)::numeric(14,2) AS "openingBank",
+                    (
+                        cash.opening
+                        + cash.received
+                        - cash."transferOut"
+                        - cash."cashExpenses"
+                        - point_cash."pointsExpense"
+                        - raffle_cash."raffleExpense"
+                        - ticket_cash."ticketOutExpense"
+                        - bonus_cash."bonusExpense"
+                        - lucky_bird_cash."luckyBirdExpense"
+                        - cash."ownerWithdrawals"
+                    )::numeric(14,2) AS "balance"
+                FROM active_sessions s
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COALESCE(SUM(t."Amount") FILTER (WHERE t."Type" IN ('OPENING','OPENING_TRANSFER')),0)::numeric(14,2) AS opening,
+                        COALESCE(SUM(t."Amount") FILTER (WHERE t."Type" IN ('CASH_RECEIVED','TRANSFER_IN')),0)::numeric(14,2) AS received,
+                        COALESCE(SUM(t."Amount") FILTER (WHERE t."Type"='TRANSFER_OUT'),0)::numeric(14,2) AS "transferOut",
+                        COALESCE(SUM(t."Amount") FILTER (WHERE t."Type"='EXPENSE'),0)::numeric(14,2) AS "cashExpenses",
+                        COALESCE(SUM(t."Amount") FILTER (WHERE t."Type"='OWNER_WITHDRAWAL'),0)::numeric(14,2) AS "ownerWithdrawals"
+                    FROM "SessionCashTransactions" t
+                    WHERE t."SessionId"=s."sessionId"
+                ) cash ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(cm."Points"),0)::numeric(14,2) AS "pointsExpense"
+                    FROM "CustomerMatch" cm
+                    WHERE cm."EmployeeSessionId"=s."sessionId"
+                      AND cm."LocationId"=$1
+                ) point_cash ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(rf."WinningAmount"),0)::numeric(14,2) AS "raffleExpense"
+                    FROM "Raffles" rf
+                    WHERE rf."EmployeeSessionId"=s."sessionId"
+                      AND rf."Status"='WINNER'
+                ) raffle_cash ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(tk."Amount"),0)::numeric(14,2) AS "ticketOutExpense"
+                    FROM "TicketOuts" tk
+                    WHERE tk."EmployeeSessionId"=s."sessionId"
+                ) ticket_cash ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense"
+                    FROM "BonusAwards" b
+                    WHERE b."EmployeeSessionId"=s."sessionId"
+                ) bonus_cash ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense"
+                    FROM "LuckyBirdAwards" lb
+                    WHERE lb."EmployeeSessionId"=s."sessionId"
+                ) lucky_bird_cash ON true
+                ORDER BY s."clockIn" ASC, s."sessionId" ASC
+                `,
+                [locationId]
+            )
+
+            return res.status(200).json({
+                success: true,
+                message: 'Current employee sessions retrieved successfully.',
+                code: 20000,
+                data: result.rows
+            })
+        } catch (error) {
+            console.error('Active employee sessions dashboard error:', error)
+
+            return res.status(500).json({
+                success: false,
+                message: 'Unable to retrieve current employee sessions.',
+                code: 50000
+            })
+        }
+    }
+)
+
+
 module.exports = router

@@ -25,6 +25,22 @@ function isSystemAdmin(req) {
     return normalizeRoleName(req.authUser?.roleName) === 'system admin'
 }
 
+function isOwner(req) {
+    return normalizeRoleName(req.authUser?.roleName) === 'owner'
+}
+
+function isAdmin(req) {
+    return normalizeRoleName(req.authUser?.roleName) === 'admin'
+}
+
+function normalizeLocationIds(values = []) {
+    return [...new Set(
+        (Array.isArray(values) ? values : [])
+            .map(value => Number(value))
+            .filter(value => Number.isInteger(value) && value > 0)
+    )]
+}
+
 // ============================================================
 // VERIFY LOCATION ACCESS
 //
@@ -93,9 +109,52 @@ async function verifyLocationAccess(
         }
     }
 
+    if (isOwner(req)) {
+        return {
+            success: true,
+            location
+        }
+    }
+
+    if (
+        Number(req.authUser.locationId) ===
+        Number(location.id)
+    ) {
+        return {
+            success: true,
+            location
+        }
+    }
+
+    if (isAdmin(req)) {
+        const accessResult = await db.query(
+            `
+            SELECT 1
+            FROM "UserLocationAccess"
+            WHERE "UserId" = $1
+              AND "LocationId" = $2
+            LIMIT 1
+            `,
+            [
+                Number(req.authUser.id),
+                Number(location.id)
+            ]
+        )
+
+        if (accessResult.rowCount) {
+            return {
+                success: true,
+                location
+            }
+        }
+    }
+
     return {
-        success: true,
-        location
+        success: false,
+        status: 403,
+        code: 40300,
+        message:
+            'You do not have access to this location.'
     }
 }
 
@@ -181,6 +240,17 @@ async function verifyUserAccess(
             message:
                 'You cannot access a user from another company.'
         }
+    }
+
+    const locationAccess =
+        await verifyLocationAccess(
+            db,
+            req,
+            user.locationId
+        )
+
+    if (!locationAccess.success) {
+        return locationAccess
     }
 
     return {
@@ -327,6 +397,17 @@ router.get(
             u."JobTitle" AS "jobTitle",
             u."RoleId" AS "roleId",
             r."Name" AS "roleName",
+            u."LocationId" AS "locationId",
+            l."name" AS "locationName",
+            COALESCE(
+              ARRAY(
+                SELECT ula."LocationId"
+                FROM "UserLocationAccess" ula
+                WHERE ula."UserId" = u."ID"
+                ORDER BY ula."LocationId"
+              ),
+              ARRAY[]::integer[]
+            ) AS "additionalLocationIds",
             u."Avatar" AS avatar,
             TO_CHAR(
               u."DateCreated",
@@ -344,8 +425,23 @@ router.get(
               r."ID" =
                 u."RoleId"
 
+          INNER JOIN
+            "Locations" l
+
+            ON
+              l."ID" =
+                u."LocationId"
+
           WHERE
-            u."LocationId" = $1
+            (
+              u."LocationId" = $1
+              OR EXISTS (
+                SELECT 1
+                FROM "UserLocationAccess" ula
+                WHERE ula."UserId" = u."ID"
+                  AND ula."LocationId" = $1
+              )
+            )
 
           ORDER BY
             u."IsActive" DESC,
@@ -429,6 +525,15 @@ router.get(
             u."Avatar" AS avatar,
             u."LocationId" AS "locationId",
             l."CompanyId" AS "companyId",
+            COALESCE(
+              ARRAY(
+                SELECT ula."LocationId"
+                FROM "UserLocationAccess" ula
+                WHERE ula."UserId" = u."ID"
+                ORDER BY ula."LocationId"
+              ),
+              ARRAY[]::integer[]
+            ) AS "additionalLocationIds",
             u."IsActive" AS "isActive"
 
           FROM
@@ -500,7 +605,8 @@ router.post(
                 jobTitle,
                 roleId,
                 locationid,
-                avatar
+                avatar,
+                additionalLocationIds = []
             } = req.body
 
             if (
@@ -562,6 +668,34 @@ router.post(
                         message:
                             roleAccess.message
                     })
+            }
+
+            const targetRoleName =
+                normalizeRoleName(roleAccess.role.name)
+
+            const normalizedAdditionalLocationIds =
+                normalizeLocationIds(additionalLocationIds)
+                    .filter(id => Number(id) !== Number(locationid))
+
+            if (targetRoleName === 'admin') {
+                for (const additionalLocationId of normalizedAdditionalLocationIds) {
+                    const additionalAccess =
+                        await verifyLocationAccess(
+                            pool,
+                            req,
+                            additionalLocationId
+                        )
+
+                    if (!additionalAccess.success) {
+                        return res
+                            .status(additionalAccess.status)
+                            .json({
+                                success: false,
+                                code: additionalAccess.code,
+                                message: additionalAccess.message
+                            })
+                    }
+                }
             }
 
             // ========================================================
@@ -667,6 +801,24 @@ router.post(
                     ]
                 )
 
+            if (targetRoleName === 'admin') {
+                for (const additionalLocationId of normalizedAdditionalLocationIds) {
+                    await pool.query(
+                        `
+                        INSERT INTO "UserLocationAccess"
+                          ("UserId", "LocationId", "AssignedBy")
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT ("UserId", "LocationId") DO NOTHING
+                        `,
+                        [
+                            Number(result.rows[0].id),
+                            Number(additionalLocationId),
+                            Number(req.authUser.id)
+                        ]
+                    )
+                }
+            }
+
             return res.status(201).json({
                 success: true,
                 message:
@@ -715,7 +867,8 @@ router.put(
                 roleId,
                 locationid,
                 avatar,
-                isActive
+                isActive,
+                additionalLocationIds = []
             } = req.body
 
             const userId =
@@ -804,6 +957,34 @@ router.put(
                         message:
                             roleAccess.message
                     })
+            }
+
+            const targetRoleName =
+                normalizeRoleName(roleAccess.role.name)
+
+            const normalizedAdditionalLocationIds =
+                normalizeLocationIds(additionalLocationIds)
+                    .filter(id => Number(id) !== Number(locationid))
+
+            if (targetRoleName === 'admin') {
+                for (const additionalLocationId of normalizedAdditionalLocationIds) {
+                    const additionalAccess =
+                        await verifyLocationAccess(
+                            client,
+                            req,
+                            additionalLocationId
+                        )
+
+                    if (!additionalAccess.success) {
+                        return res
+                            .status(additionalAccess.status)
+                            .json({
+                                success: false,
+                                code: additionalAccess.code,
+                                message: additionalAccess.message
+                            })
+                    }
+                }
             }
 
             // ========================================================
@@ -953,6 +1134,29 @@ router.put(
                         userId
                     ]
                 )
+            }
+
+            await client.query(
+                `DELETE FROM "UserLocationAccess" WHERE "UserId" = $1`,
+                [userId]
+            )
+
+            if (targetRoleName === 'admin') {
+                for (const additionalLocationId of normalizedAdditionalLocationIds) {
+                    await client.query(
+                        `
+                        INSERT INTO "UserLocationAccess"
+                          ("UserId", "LocationId", "AssignedBy")
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT ("UserId", "LocationId") DO NOTHING
+                        `,
+                        [
+                            userId,
+                            Number(additionalLocationId),
+                            Number(req.authUser.id)
+                        ]
+                    )
+                }
             }
 
             await client.query(

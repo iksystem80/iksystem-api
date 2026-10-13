@@ -3,6 +3,8 @@ const { getAuthenticatedUser } = require('../middleware/auth')
 
 const normalizedRole = req => String(req.authUser?.roleName || '').trim().toLowerCase()
 const isSystemAdmin = req => normalizedRole(req) === 'system admin'
+const isOwner = req => normalizedRole(req) === 'owner'
+const isAdmin = req => normalizedRole(req) === 'admin'
 
 async function ensureAuthenticated(req, res) {
     if (req.authUser) return true
@@ -37,6 +39,46 @@ async function resolveRoleId(req) {
     return result.rowCount ? Number(result.rows[0].RoleId) : null
 }
 
+async function hasLocationAccess(req, locationId) {
+    if (!req.authUser || !locationId) return false
+    if (isSystemAdmin(req)) return true
+
+    const locationResult = await pool.query(`
+        SELECT l."ID", l."CompanyId", l."IsActive", c."IsActive" AS "CompanyIsActive"
+        FROM "Locations" l
+        LEFT JOIN "Companies" c ON c."ID"=l."CompanyId"
+        WHERE l."ID"=$1
+        LIMIT 1`, [locationId])
+
+    if (!locationResult.rowCount) return false
+
+    const location = locationResult.rows[0]
+    if (location.IsActive === false || location.CompanyIsActive === false) return false
+
+    const authCompanyId = Number(req.authUser?.companyId ?? req.authUser?.companyid)
+    if (!Number.isSafeInteger(authCompanyId) || authCompanyId <= 0) return false
+    if (Number(location.CompanyId) !== authCompanyId) return false
+
+    if (isOwner(req)) return true
+
+    const primaryLocationId = Number(req.authUser?.locationId ?? req.authUser?.locationid)
+    if (Number.isSafeInteger(primaryLocationId) && primaryLocationId > 0 && primaryLocationId === locationId) return true
+
+    if (!isAdmin(req)) return false
+
+    const userId = Number(req.authUser?.id)
+    if (!Number.isSafeInteger(userId) || userId <= 0) return false
+
+    const accessResult = await pool.query(`
+        SELECT 1
+        FROM "UserLocationAccess"
+        WHERE "UserId"=$1
+          AND "LocationId"=$2
+        LIMIT 1`, [userId, locationId])
+
+    return accessResult.rowCount > 0
+}
+
 async function hasModuleAccess(req, codes) {
     if (!req.authUser) return false
     if (isSystemAdmin(req)) return true
@@ -45,9 +87,7 @@ async function hasModuleAccess(req, codes) {
     const roleId = await resolveRoleId(req)
     if (!locationId || !roleId) return false
 
-    // Normal users are never allowed to switch authorization context to another location.
-    const assignedLocation = Number(req.authUser?.locationId)
-    if (Number.isSafeInteger(assignedLocation) && assignedLocation > 0 && assignedLocation !== locationId) return false
+    if (!(await hasLocationAccess(req, locationId))) return false
 
     const wanted = (Array.isArray(codes) ? codes : [codes]).map(x => String(x || '').trim()).filter(Boolean)
     if (!wanted.length) return false
@@ -98,9 +138,17 @@ function requireAnyAssignedModule() {
         try {
             if (!(await ensureAuthenticated(req, res))) return
             if (isSystemAdmin(req)) return next()
+
             const locationId = requestLocationId(req)
             const roleId = await resolveRoleId(req)
-            if (!locationId || !roleId) return res.status(403).json({ success: false, code: 40300, message: 'No location/module access.' })
+            if (!locationId || !roleId) {
+                return res.status(403).json({ success: false, code: 40300, message: 'No location/module access.' })
+            }
+
+            if (!(await hasLocationAccess(req, locationId))) {
+                return res.status(403).json({ success: false, code: 40300, message: 'No location/module access.' })
+            }
+
             const result = await pool.query(`SELECT 1 FROM "LocationRoleModules" r
                 JOIN "LocationModules" l ON l."LocationId"=r."LocationId" AND l."ModuleId"=r."ModuleId"
                 JOIN "AppModules" m ON m."ID"=r."ModuleId" AND m."IsActive"=true

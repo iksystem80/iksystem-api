@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict LPST9jLDaoWfKdJWS8dBUc2mRZOHGvfN4WxebWk5mdo8jn6R12TMVD1CuIYJIWv
+\restrict KpeuMa4cxjYWEvxQLEg6QuOMWPabXD84DRPF4FSzQUHZrWstKknWmGSdS0ga6PZ
 
 -- Dumped from database version 18.6
 -- Dumped by pg_dump version 18.6
@@ -307,7 +307,8 @@ CREATE TABLE public."Companies" (
     "Code" character varying(50),
     "IsActive" boolean DEFAULT true NOT NULL,
     "DateCreated" timestamp without time zone DEFAULT now() NOT NULL,
-    "DateUpdated" timestamp without time zone
+    "DateUpdated" timestamp without time zone,
+    "IsSuspended" boolean DEFAULT false NOT NULL
 );
 
 
@@ -782,7 +783,8 @@ CREATE TABLE public."Locations" (
     name character varying(100),
     "IsActive" boolean,
     "CompanyId" integer,
-    "AllowFaceCheckin" boolean DEFAULT false
+    "AllowFaceCheckin" boolean DEFAULT false,
+    "IsSuspended" boolean DEFAULT false NOT NULL
 );
 
 
@@ -1777,6 +1779,18 @@ ALTER SEQUENCE public."TicketOuts_ID_seq" OWNED BY public."TicketOuts"."ID";
 
 
 --
+-- Name: UserLocationAccess; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public."UserLocationAccess" (
+    "UserId" integer NOT NULL,
+    "LocationId" integer NOT NULL,
+    "AssignedBy" integer,
+    "DateCreated" timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: Users; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2033,6 +2047,9 @@ COPY public."BonusScheduleDay" ("ID", "ScheduleBlockId", "DayOfWeek") FROM stdin
 --
 
 COPY public."CheckIn" ("ID", "CustomerId", "CheckInDate", "Photo", "Status", "LocationId", "ApprovedBy", "ApprovedDate", "FaceDistance", "CheckOutDate", "IsCheckOut") FROM stdin;
+3	3	2026-10-12 12:51:07.153382	\N	t	1	6	2026-10-12 13:21:58.282395	\N	\N	f
+2	27	2026-10-12 12:50:50.078648	\N	t	1	6	2026-10-12 13:34:39.118978	\N	\N	f
+1	30	2026-10-12 12:50:30.405739	\N	t	1	6	2026-10-12 21:38:47.082564	\N	\N	f
 \.
 
 
@@ -2040,9 +2057,10 @@ COPY public."CheckIn" ("ID", "CustomerId", "CheckInDate", "Photo", "Status", "Lo
 -- Data for Name: Companies; Type: TABLE DATA; Schema: public; Owner: -
 --
 
-COPY public."Companies" ("ID", "Name", "Code", "IsActive", "DateCreated", "DateUpdated") FROM stdin;
-1	IK System Ltd	IKS	t	2026-09-20 20:11:02.990914	2026-09-22 08:20:09.858232
-2	Mak Goup LLC	MKG	t	2026-09-22 08:21:28.911706	\N
+COPY public."Companies" ("ID", "Name", "Code", "IsActive", "DateCreated", "DateUpdated", "IsSuspended") FROM stdin;
+2	Mak Goup LLC	MKG	t	2026-09-22 08:21:28.911706	\N	f
+1	IK System Ltd	IKS	t	2026-09-20 20:11:02.990914	2026-10-12 10:28:13.945253	f
+3	Ladjis	096	t	2026-10-12 10:32:31.605755	\N	f
 \.
 
 
@@ -2092,7 +2110,6 @@ COPY public."Customer" ("ID", "Firstname", "Lastname", "DOB", avatar, "Phone", "
 24	Maria	Pina	2000-06-20	https://i.pravatar.cc/300?img=24	2221000024	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
 25	Mary	Marrugo	2000-06-20	https://i.pravatar.cc/300?img=25	2221000025	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
 26	Donald	Booker	2000-06-20	https://i.pravatar.cc/300?img=26	2221000026	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
-27	Beatrice	James	2000-06-20	https://i.pravatar.cc/300?img=27	2221000027	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
 28	Esmeralda	Anguiano	2000-06-20	https://i.pravatar.cc/300?img=28	2221000028	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
 29	Josue	Sandoval	2000-06-20	https://i.pravatar.cc/300?img=29	2221000029	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
 31	Jasten	Najera	2000-06-20	https://i.pravatar.cc/300?img=31	2221000031	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	\N
@@ -2173,6 +2190,7 @@ COPY public."Customer" ("ID", "Firstname", "Lastname", "DOB", avatar, "Phone", "
 42	Ana	Rocha	2000-06-20	https://i.pravatar.cc/300?img=42	2221000042	20	2026-09-22 08:35:04.539523	t	1	\N	t	2	f	f	f	\N	\N
 33	Christopher	Jackson	2000-06-20	https://i.pravatar.cc/300?img=33	2221000033	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	Bypass
 30	Abraham	Martinez	2000-06-20	https://i.pravatar.cc/300?img=30	2221000030	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	t	t	f	\N	Bypass
+27	Beatrice	James	2000-06-20	https://i.pravatar.cc/300?img=27	2221000027	20	2026-09-22 08:35:04.539523	t	1	\N	f	2	f	f	f	\N	Bypass
 \.
 
 
@@ -2194,6 +2212,9 @@ COPY public."CustomerLog" ("ID", "CustomerID", "UserID", "LogType", "OldValue", 
 --
 
 COPY public."CustomerMatch" ("ID", "CustomerId", "MachineId", "Points", "DateAssign", "ImageUrl", "AssignedBy", "LocationId", "CheckinId", "ReviewStatus", "ReviewedBy", "ReviewedAt", "EmployeeSessionId", "IsExtraMatch") FROM stdin;
+1	3	1	20	2026-10-12 13:21:58.282395	https://res.cloudinary.com/moqaqhrc/image/upload/v1791829319/customers/uv2qmqtatsnmzuxhjdwk.png	6	1	3	Pending	\N	\N	1	f
+2	27	1	20	2026-10-12 13:34:39.118978	https://res.cloudinary.com/moqaqhrc/image/upload/v1791830080/customers/prisaemfgr2fp0zgkheu.png	6	1	2	Pending	\N	\N	1	f
+3	30	3	20	2026-10-12 21:38:47.082564	https://res.cloudinary.com/moqaqhrc/image/upload/v1791859127/customers/gxn6w9djxhnq9y7nzsib.png	6	1	1	Pending	\N	\N	1	f
 \.
 
 
@@ -2202,6 +2223,8 @@ COPY public."CustomerMatch" ("ID", "CustomerId", "MachineId", "Points", "DateAss
 --
 
 COPY public."EmployeeSession" ("ID", "UserId", "LocationId", "ClockIn", "ClockOut", "TotalWorkingHours", "IsPaid", "CreatedAt", "ReadingSessionId") FROM stdin;
+2	12	1	2026-10-12 21:43:06.212967-05	\N	0.00	f	2026-10-12 21:43:06.212967-05	\N
+1	6	1	2026-10-12 12:08:46.473881-05	2026-10-12 21:47:32.860069-05	9.65	f	2026-10-12 12:08:46.473881-05	\N
 \.
 
 
@@ -2263,6 +2286,8 @@ COPY public."LocationCashCapital" ("ID", "LocationId", "ToAccountId", "Amount", 
 --
 
 COPY public."LocationCashEntries" ("ID", "LocationId", "AccountId", "Amount", "Kind", "TransferId", "MovementKey", "CapitalId", "ReadingProfitPostingId", "FundingId", "ExpenseTypeId", "SessionTransactionId", "Notes", "CreatedBy", "CreatedAt") FROM stdin;
+1	1	1	15000.00	INITIAL_CAPITAL	\N	\N	\N	\N	\N	\N	\N	Initial Owner Capital · ADD BANK	4	2026-10-12 08:43:43.872-05
+2	1	1	-15000.00	EMPLOYEE_SUPPORT	\N	\N	\N	\N	\N	\N	\N	Opening Bank released to employee session #1 · first location opening before any prior shift close	6	2026-10-12 12:32:32.185775-05
 \.
 
 
@@ -2364,31 +2389,56 @@ COPY public."LocationModules" ("LocationId", "ModuleId", "AssignedBy", "Assigned
 1	25	1	2026-10-11 11:03:00.166833-05
 1	26	1	2026-10-11 11:03:00.166833-05
 1	27	1	2026-10-11 11:03:00.166833-05
-2	1	1	2026-10-11 11:03:21.039371-05
-2	2	1	2026-10-11 11:03:21.039371-05
-2	3	1	2026-10-11 11:03:21.039371-05
-2	4	1	2026-10-11 11:03:21.039371-05
-2	5	1	2026-10-11 11:03:21.039371-05
-2	6	1	2026-10-11 11:03:21.039371-05
-2	7	1	2026-10-11 11:03:21.039371-05
-2	8	1	2026-10-11 11:03:21.039371-05
-2	9	1	2026-10-11 11:03:21.039371-05
-2	10	1	2026-10-11 11:03:21.039371-05
-2	11	1	2026-10-11 11:03:21.039371-05
-2	12	1	2026-10-11 11:03:21.039371-05
-2	15	1	2026-10-11 11:03:21.039371-05
-2	16	1	2026-10-11 11:03:21.039371-05
-2	17	1	2026-10-11 11:03:21.039371-05
-2	18	1	2026-10-11 11:03:21.039371-05
-2	19	1	2026-10-11 11:03:21.039371-05
-2	20	1	2026-10-11 11:03:21.039371-05
-2	21	1	2026-10-11 11:03:21.039371-05
-2	22	1	2026-10-11 11:03:21.039371-05
-2	23	1	2026-10-11 11:03:21.039371-05
-2	24	1	2026-10-11 11:03:21.039371-05
-2	25	1	2026-10-11 11:03:21.039371-05
-2	26	1	2026-10-11 11:03:21.039371-05
-2	27	1	2026-10-11 11:03:21.039371-05
+2	1	1	2026-10-12 10:19:39.840647-05
+2	2	1	2026-10-12 10:19:39.840647-05
+2	3	1	2026-10-12 10:19:39.840647-05
+2	4	1	2026-10-12 10:19:39.840647-05
+2	5	1	2026-10-12 10:19:39.840647-05
+2	6	1	2026-10-12 10:19:39.840647-05
+2	7	1	2026-10-12 10:19:39.840647-05
+2	8	1	2026-10-12 10:19:39.840647-05
+2	9	1	2026-10-12 10:19:39.840647-05
+2	10	1	2026-10-12 10:19:39.840647-05
+2	11	1	2026-10-12 10:19:39.840647-05
+2	12	1	2026-10-12 10:19:39.840647-05
+2	15	1	2026-10-12 10:19:39.840647-05
+2	16	1	2026-10-12 10:19:39.840647-05
+2	17	1	2026-10-12 10:19:39.840647-05
+2	18	1	2026-10-12 10:19:39.840647-05
+2	19	1	2026-10-12 10:19:39.840647-05
+2	20	1	2026-10-12 10:19:39.840647-05
+2	21	1	2026-10-12 10:19:39.840647-05
+2	22	1	2026-10-12 10:19:39.840647-05
+2	23	1	2026-10-12 10:19:39.840647-05
+2	24	1	2026-10-12 10:19:39.840647-05
+2	25	1	2026-10-12 10:19:39.840647-05
+2	26	1	2026-10-12 10:19:39.840647-05
+2	27	1	2026-10-12 10:19:39.840647-05
+5	1	1	2026-10-12 10:45:10.804807-05
+5	2	1	2026-10-12 10:45:10.804807-05
+5	3	1	2026-10-12 10:45:10.804807-05
+5	4	1	2026-10-12 10:45:10.804807-05
+5	5	1	2026-10-12 10:45:10.804807-05
+5	6	1	2026-10-12 10:45:10.804807-05
+5	7	1	2026-10-12 10:45:10.804807-05
+5	8	1	2026-10-12 10:45:10.804807-05
+5	9	1	2026-10-12 10:45:10.804807-05
+5	10	1	2026-10-12 10:45:10.804807-05
+5	11	1	2026-10-12 10:45:10.804807-05
+5	12	1	2026-10-12 10:45:10.804807-05
+5	15	1	2026-10-12 10:45:10.804807-05
+5	16	1	2026-10-12 10:45:10.804807-05
+5	17	1	2026-10-12 10:45:10.804807-05
+5	18	1	2026-10-12 10:45:10.804807-05
+5	19	1	2026-10-12 10:45:10.804807-05
+5	20	1	2026-10-12 10:45:10.804807-05
+5	21	1	2026-10-12 10:45:10.804807-05
+5	22	1	2026-10-12 10:45:10.804807-05
+5	23	1	2026-10-12 10:45:10.804807-05
+5	24	1	2026-10-12 10:45:10.804807-05
+5	25	1	2026-10-12 10:45:10.804807-05
+5	26	1	2026-10-12 10:45:10.804807-05
+5	27	1	2026-10-12 10:45:10.804807-05
 \.
 
 
@@ -2593,15 +2643,76 @@ COPY public."LocationRoleModules" ("LocationId", "RoleId", "ModuleId", "Assigned
 1	3	18	4	2026-10-11 11:13:19.612608-05
 1	3	19	4	2026-10-11 11:13:19.612608-05
 1	3	20	4	2026-10-11 11:13:19.612608-05
-1	4	1	4	2026-10-11 11:15:46.11685-05
-1	4	3	4	2026-10-11 11:15:46.11685-05
-1	4	4	4	2026-10-11 11:15:46.11685-05
-1	4	5	4	2026-10-11 11:15:46.11685-05
-1	4	6	4	2026-10-11 11:15:46.11685-05
-1	4	7	4	2026-10-11 11:15:46.11685-05
-1	4	8	4	2026-10-11 11:15:46.11685-05
-1	4	15	4	2026-10-11 11:15:46.11685-05
-1	4	16	4	2026-10-11 11:15:46.11685-05
+1	1	1	4	2026-10-12 08:19:11.229532-05
+1	1	8	4	2026-10-12 08:19:11.229532-05
+1	1	9	4	2026-10-12 08:19:11.229532-05
+1	1	10	4	2026-10-12 08:19:11.229532-05
+1	1	11	4	2026-10-12 08:19:11.229532-05
+1	1	12	4	2026-10-12 08:19:11.229532-05
+1	1	16	4	2026-10-12 08:19:11.229532-05
+1	1	17	4	2026-10-12 08:19:11.229532-05
+1	1	18	4	2026-10-12 08:19:11.229532-05
+1	1	19	4	2026-10-12 08:19:11.229532-05
+1	1	20	4	2026-10-12 08:19:11.229532-05
+1	1	21	4	2026-10-12 08:19:11.229532-05
+1	1	22	4	2026-10-12 08:19:11.229532-05
+1	1	23	4	2026-10-12 08:19:11.229532-05
+1	1	24	4	2026-10-12 08:19:11.229532-05
+1	1	25	4	2026-10-12 08:19:11.229532-05
+1	1	26	4	2026-10-12 08:19:11.229532-05
+1	1	27	4	2026-10-12 08:19:11.229532-05
+2	1	1	5	2026-10-12 10:22:06.931477-05
+2	1	8	5	2026-10-12 10:22:06.931477-05
+2	1	9	5	2026-10-12 10:22:06.931477-05
+2	1	10	5	2026-10-12 10:22:06.931477-05
+2	1	11	5	2026-10-12 10:22:06.931477-05
+2	1	12	5	2026-10-12 10:22:06.931477-05
+2	1	16	5	2026-10-12 10:22:06.931477-05
+2	1	17	5	2026-10-12 10:22:06.931477-05
+2	1	18	5	2026-10-12 10:22:06.931477-05
+2	1	19	5	2026-10-12 10:22:06.931477-05
+2	1	20	5	2026-10-12 10:22:06.931477-05
+2	1	21	5	2026-10-12 10:22:06.931477-05
+2	1	22	5	2026-10-12 10:22:06.931477-05
+2	1	23	5	2026-10-12 10:22:06.931477-05
+2	1	24	5	2026-10-12 10:22:06.931477-05
+2	1	25	5	2026-10-12 10:22:06.931477-05
+2	1	26	5	2026-10-12 10:22:06.931477-05
+2	1	27	5	2026-10-12 10:22:06.931477-05
+5	1	1	1	2026-10-12 10:45:10.804807-05
+5	1	2	1	2026-10-12 10:45:10.804807-05
+5	1	3	1	2026-10-12 10:45:10.804807-05
+5	1	4	1	2026-10-12 10:45:10.804807-05
+5	1	5	1	2026-10-12 10:45:10.804807-05
+5	1	6	1	2026-10-12 10:45:10.804807-05
+5	1	7	1	2026-10-12 10:45:10.804807-05
+5	1	8	1	2026-10-12 10:45:10.804807-05
+5	1	9	1	2026-10-12 10:45:10.804807-05
+5	1	10	1	2026-10-12 10:45:10.804807-05
+5	1	11	1	2026-10-12 10:45:10.804807-05
+5	1	12	1	2026-10-12 10:45:10.804807-05
+5	1	15	1	2026-10-12 10:45:10.804807-05
+5	1	16	1	2026-10-12 10:45:10.804807-05
+5	1	17	1	2026-10-12 10:45:10.804807-05
+5	1	18	1	2026-10-12 10:45:10.804807-05
+5	1	19	1	2026-10-12 10:45:10.804807-05
+5	1	20	1	2026-10-12 10:45:10.804807-05
+5	1	21	1	2026-10-12 10:45:10.804807-05
+5	1	22	1	2026-10-12 10:45:10.804807-05
+5	1	23	1	2026-10-12 10:45:10.804807-05
+5	1	24	1	2026-10-12 10:45:10.804807-05
+5	1	25	1	2026-10-12 10:45:10.804807-05
+5	1	26	1	2026-10-12 10:45:10.804807-05
+5	1	27	1	2026-10-12 10:45:10.804807-05
+1	4	1	4	2026-10-12 12:55:51.243445-05
+1	4	3	4	2026-10-12 12:55:51.243445-05
+1	4	4	4	2026-10-12 12:55:51.243445-05
+1	4	5	4	2026-10-12 12:55:51.243445-05
+1	4	6	4	2026-10-12 12:55:51.243445-05
+1	4	7	4	2026-10-12 12:55:51.243445-05
+1	4	8	4	2026-10-12 12:55:51.243445-05
+1	4	15	4	2026-10-12 12:55:51.243445-05
+1	4	16	4	2026-10-12 12:55:51.243445-05
 \.
 
 
@@ -2611,6 +2722,7 @@ COPY public."LocationRoleModules" ("LocationId", "RoleId", "ModuleId", "Assigned
 
 COPY public."LocationRuleSettings" ("ID", "LocationId", "MatchRuleEnabled", "MatchRuleName", "MatchCooldownHours", "MatchMaxPerDay", "MatchResetTimes", "MatchResetDayTime", "NfcTicketOutEnabled", "AuditVerificationEnabled", "PhoneVerificationRequired", "NuVueBoostEnabled", "TicketPhotoRequired", "TicketPhotoMinAmount", "VipMatchEnabled", "VipMatchMinPoints", "CreatedAt", "UpdatedAt", "UpdatedBy", "LuckyBirdEnabled", "LuckyBirdMaxCustomersPerDay") FROM stdin;
 1	1	t	MATCH	2	2	["06:00", "18:00"]	06:00:00	f	t	f	f	t	10.00	t	10	2026-10-03 10:17:22.991248-05	2026-10-10 22:29:50.584685-05	4	t	2
+49	2	f	MATCH	3	2	["07:00", "19:00"]	07:00:00	f	f	f	f	f	10.00	f	10	2026-10-12 10:21:24.344219-05	2026-10-12 10:21:24.344219-05	\N	f	1
 \.
 
 
@@ -2618,11 +2730,12 @@ COPY public."LocationRuleSettings" ("ID", "LocationId", "MatchRuleEnabled", "Mat
 -- Data for Name: Locations; Type: TABLE DATA; Schema: public; Owner: -
 --
 
-COPY public."Locations" ("ID", name, "IsActive", "CompanyId", "AllowFaceCheckin") FROM stdin;
-2	VENUS (017)	t	1	f
-3	Lucky Star	t	1	f
-4	Money Ball	t	2	t
-1	99 RICHEST (021)	t	1	f
+COPY public."Locations" ("ID", name, "IsActive", "CompanyId", "AllowFaceCheckin", "IsSuspended") FROM stdin;
+4	Money Ball	t	2	t	f
+3	Lucky Star	f	1	f	t
+1	99 RICHEST (021)	t	1	f	f
+5	Play Box	t	3	f	f
+2	VENUS (017)	t	1	f	f
 \.
 
 
@@ -3039,11 +3152,11 @@ COPY public."RolePermissions" ("RoleId", "PermissionId") FROM stdin;
 
 COPY public."Roles" ("ID", "Name", "Description", "IsSystem", "IsActive", "DateCreated", "DateUpdated") FROM stdin;
 10	CheckIn	Customer CheckIn	f	t	2026-09-25 08:55:11.60375	2026-09-25 09:02:42.939703
-1	Owner	Full system access	f	t	2026-09-19 23:36:29.266674	\N
 9	System Admin	System Admin	t	t	2026-09-20 18:53:18.079997	\N
 2	Admin	Administrative access	f	t	2026-09-19 23:36:29.266674	2026-09-26 21:58:50.119176
 3	Manager	Management access	f	t	2026-09-19 23:36:29.266674	2026-10-11 11:13:19.612608
-4	Employee	Standard employee access	f	t	2026-09-19 23:36:29.266674	2026-10-11 11:15:46.11685
+1	Owner	Full system access	f	t	2026-09-19 23:36:29.266674	2026-10-12 10:22:06.931477
+4	Employee	Standard employee access	f	t	2026-09-19 23:36:29.266674	2026-10-12 12:55:51.243445
 \.
 
 
@@ -3052,6 +3165,7 @@ COPY public."Roles" ("ID", "Name", "Description", "IsSystem", "IsActive", "DateC
 --
 
 COPY public."SessionCashClosings" ("SessionId", "LocationId", "ClosingBalance", "HandoverId", "ClosedBy", "ClosedAt", "ActualCash", "Variance") FROM stdin;
+1	1	9865.00	1	6	2026-10-12 21:47:32.860069-05	9865.00	0.00
 \.
 
 
@@ -3060,6 +3174,7 @@ COPY public."SessionCashClosings" ("SessionId", "LocationId", "ClosingBalance", 
 --
 
 COPY public."SessionCashHandovers" ("ID", "FromSessionId", "FromUserId", "ToUserId", "ToSessionId", "LocationId", "Amount", "Status", "Notes", "CreatedAt", "AcceptedAt", "AcceptedBy") FROM stdin;
+1	1	6	12	2	1	9865.00	Accepted	\N	2026-10-12 21:47:32.860069-05	2026-10-12 21:47:45.224466-05	12
 \.
 
 
@@ -3068,6 +3183,11 @@ COPY public."SessionCashHandovers" ("ID", "FromSessionId", "FromUserId", "ToUser
 --
 
 COPY public."SessionCashTransactions" ("ID", "SessionId", "LocationId", "Type", "Amount", "ExpenseTypeId", "Notes", "TransferId", "CreatedBy", "CreatedAt", "FundingId", "CreditTypeId") FROM stdin;
+2	1	1	OPENING	15000.00	\N	\N	\N	6	2026-10-12 12:32:32.185775-05	\N	\N
+3	1	1	EXPENSE	50.00	2	\N	\N	6	2026-10-12 21:30:01.933227-05	\N	\N
+4	1	1	TRANSFER_OUT	5000.00	\N	Transferred to Chino	\N	6	2026-10-12 21:43:44.992082-05	\N	\N
+5	2	1	TRANSFER_IN	5000.00	\N	Transferred from Ale	\N	6	2026-10-12 21:43:44.992082-05	\N	\N
+6	2	1	OPENING_TRANSFER	9865.00	\N	Handover from session #1	1	12	2026-10-12 21:47:45.224466-05	\N	\N
 \.
 
 
@@ -3076,6 +3196,17 @@ COPY public."SessionCashTransactions" ("ID", "SessionId", "LocationId", "Type", 
 --
 
 COPY public."TicketOuts" ("ID", "LocationId", "EmployeeSessionId", "EmployeeId", "MachineId", "Amount", "ImageUrl", "SessionTransactionId", "CreatedBy", "CreatedAt", "CustomerId") FROM stdin;
+1	1	1	6	1	10.00	https://res.cloudinary.com/moqaqhrc/image/upload/v1791834484/ticket-out/qmpkvdur3hpdkozy7io7.png	\N	6	2026-10-12 14:48:04.311437-05	27
+2	1	1	6	1	15.00	https://res.cloudinary.com/moqaqhrc/image/upload/v1791834525/ticket-out/z5adwbvfytpnddxhzgyd.png	\N	6	2026-10-12 14:48:45.456355-05	3
+\.
+
+
+--
+-- Data for Name: UserLocationAccess; Type: TABLE DATA; Schema: public; Owner: -
+--
+
+COPY public."UserLocationAccess" ("UserId", "LocationId", "AssignedBy", "DateCreated") FROM stdin;
+4	2	2	2026-10-12 11:15:56.803454
 \.
 
 
@@ -3091,7 +3222,6 @@ COPY public."Users" ("ID", "Username", "Password", token, "LocationId", "Name", 
 11	fernanda	$2b$10$RFo8O.TVT8SkQ38L5i808OMO0.KEi3rioQ7oTaTmqFDm7AUzEhDOK	838bfbbed2feec6fc31c8196e47bc1ceb0a68a4441fc6e1ced124f18bdc7791b	1	Fernanda	/upload/profile.png	t	2026-09-22 09:45:28.277279	4	\N	\N	\N	\N
 2	mike	$2b$10$Otd.Sb3S5vu7nMZD96XrUua2mFt3NCIcbdLHa286Fz0QzjRiSb75m	646a240ad28d49327da05377eadfc90d4847e9943f1a606910406ab981816dcd	1	Mike	https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif	t	2026-09-22 08:21:28.911706	1	\N	\N	Owner	\N
 3	sam	$2b$10$RLMgV6l17d0EGfQmNMWRvuMBq39o618MmTu/BPD9.XUu6jdDvVeKe	646a240ad28d49327da05377eadfc90d4847e9943f1a606910406ab981816dcd	4	Sam	https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif	t	2026-09-22 08:21:28.911706	1	\N	\N	Owner	2026-09-22 08:24:35.659343
-4	riz	$2b$10$MfRY2PVquW9rsJid2dgjwe9Ia6grdM8I7ovtoV27TF/Qsm0DfAJwC	875faac9bf1a162053f4582f4c1e610ebbac9ce9328f33ebe3beb20afa717a1b	1	Riz	https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif	t	2026-09-22 09:32:07.420064	2	\N	\N	Administrator	\N
 5	steve	$2b$10$X0SuivHgcd9lUgV0brxg0eisqpsoKfvl1sN8XhTcuFfww8klcTmiG	c170fd7617f0ce2f43943402062bc3088b2bef88073a8611bfbef0c9999e4285	2	Steve	https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif	t	2026-09-22 09:38:38.193938	2	\N	\N	Administrator	\N
 7	kassie	$2b$10$K76OVOuohDZX0gtXHwDsr.hv/gdJQ3iMRGMTrJAN7nU2PncRAHIRe	6e1cd5fb5172908843670bea779c6bb695dcfef15ac267d96c82857c600e700d	1	Kassie	/upload/profile.png	t	2026-09-22 09:43:38.144336	4	\N	\N	\N	\N
 6	ale	$2b$10$iTKewSWWNNVxChBaXL8mU.yAn3spusegNQ1aJ6toe91mDwGQ4tQgS	eb1de50e9b70f9bf6e10733e957aac8405376552a7d408bd20f2756e230209b1	1	Ale	/upload/profile.png	t	2026-09-22 09:42:52.972113	4	\N	\N	\N	2026-09-22 22:06:00.452439
@@ -3100,6 +3230,8 @@ COPY public."Users" ("ID", "Username", "Password", token, "LocationId", "Name", 
 14	alex	$2b$10$uKebuW8mK3FN/O6T.i43Ueo9EgoZ2ExAUrEVYV5i3iOpiwRA3cKNS	1908ddd16f2cd95bd08725042ae293f25cd8ded2f6415d95d7a352dab4fff525	2	Alex	/upload/profile.png	t	2026-09-24 09:26:57.710736	4	\N	\N	Employee	\N
 15	angel	$2b$10$V0sW5QDv/520g6qmAL4I/.E/1/jsp8bY0U4YMPbGEpkXyZgBre.Ny	144261491f5771d400574e46e632ed4c1b0eb2a184228dbd43162dec3ec67ef8	2	Angel	/upload/profile.png	t	2026-09-24 09:27:14.735692	4	\N	\N	Internee	\N
 16	checkin	$2b$10$rTkMQj060zIlwSkECMAozOas7BQPejVB/jIUsrMGAj0RD/0BA5WqO	fc1342413d0dfffaa7d52cf882a37775131530a33d255b38021a9deb6384a857	1	Customer CheckIn	/upload/profile.png	t	2026-09-25 09:03:45.143535	10	\N	\N	Standalone System	\N
+17	ladji	$2b$10$yrBCHOkl1klbHN./VbjHUO/AG2vi7rRKEmUAh23x48CsuLN.CaokK	477e68c9a3f51e1ce56925f5a3c191b67072221a40bb9f73d2618db577a3af2e	5	Ladji	\N	t	2026-10-12 10:32:31.605755	1	\N	\N	\N	\N
+4	riz	$2b$10$MfRY2PVquW9rsJid2dgjwe9Ia6grdM8I7ovtoV27TF/Qsm0DfAJwC	875faac9bf1a162053f4582f4c1e610ebbac9ce9328f33ebe3beb20afa717a1b	1	Riz	https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif	t	2026-09-22 09:32:07.420064	2	\N	\N	\N	2026-10-12 11:15:56.803454
 \.
 
 
@@ -3156,14 +3288,14 @@ SELECT pg_catalog.setval('public."Bonus_ID_seq"', 1, true);
 -- Name: CheckIn_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."CheckIn_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."CheckIn_ID_seq"', 3, true);
 
 
 --
 -- Name: Companies_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."Companies_ID_seq"', 2, true);
+SELECT pg_catalog.setval('public."Companies_ID_seq"', 3, true);
 
 
 --
@@ -3184,7 +3316,7 @@ SELECT pg_catalog.setval('public."CustomerLog_ID_seq"', 5, true);
 -- Name: CustomerMatch_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."CustomerMatch_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."CustomerMatch_ID_seq"', 3, true);
 
 
 --
@@ -3198,7 +3330,7 @@ SELECT pg_catalog.setval('public."Customer_ID_seq"', 110, true);
 -- Name: EmployeeSession_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."EmployeeSession_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."EmployeeSession_ID_seq"', 2, true);
 
 
 --
@@ -3219,7 +3351,7 @@ SELECT pg_catalog.setval('public."Games_ID_seq"', 7, true);
 -- Name: LocationCashAccounts_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."LocationCashAccounts_ID_seq"', 12, true);
+SELECT pg_catalog.setval('public."LocationCashAccounts_ID_seq"', 13, true);
 
 
 --
@@ -3233,7 +3365,7 @@ SELECT pg_catalog.setval('public."LocationCashCapital_ID_seq"', 1, false);
 -- Name: LocationCashEntries_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."LocationCashEntries_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."LocationCashEntries_ID_seq"', 2, true);
 
 
 --
@@ -3247,14 +3379,14 @@ SELECT pg_catalog.setval('public."LocationCashTransfers_ID_seq"', 1, false);
 -- Name: LocationRuleSettings_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."LocationRuleSettings_ID_seq"', 47, true);
+SELECT pg_catalog.setval('public."LocationRuleSettings_ID_seq"', 52, true);
 
 
 --
 -- Name: Locations_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."Locations_ID_seq"', 4, true);
+SELECT pg_catalog.setval('public."Locations_ID_seq"', 5, true);
 
 
 --
@@ -3429,28 +3561,28 @@ SELECT pg_catalog.setval('public."Roles_ID_seq"', 10, true);
 -- Name: SessionCashHandovers_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."SessionCashHandovers_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."SessionCashHandovers_ID_seq"', 1, true);
 
 
 --
 -- Name: SessionCashTransactions_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."SessionCashTransactions_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."SessionCashTransactions_ID_seq"', 6, true);
 
 
 --
 -- Name: TicketOuts_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."TicketOuts_ID_seq"', 1, false);
+SELECT pg_catalog.setval('public."TicketOuts_ID_seq"', 2, true);
 
 
 --
 -- Name: Users_ID_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public."Users_ID_seq"', 16, true);
+SELECT pg_catalog.setval('public."Users_ID_seq"', 17, true);
 
 
 --
@@ -3787,6 +3919,14 @@ ALTER TABLE ONLY public."MachineTypes"
 
 ALTER TABLE ONLY public."Machines"
     ADD CONSTRAINT "Machines_pkey" PRIMARY KEY ("ID");
+
+
+--
+-- Name: UserLocationAccess PK_UserLocationAccess; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."UserLocationAccess"
+    ADD CONSTRAINT "PK_UserLocationAccess" PRIMARY KEY ("UserId", "LocationId");
 
 
 --
@@ -4328,6 +4468,13 @@ CREATE INDEX "IX_TicketOuts_Session" ON public."TicketOuts" USING btree ("Employ
 
 
 --
+-- Name: IX_UserLocationAccess_LocationId; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IX_UserLocationAccess_LocationId" ON public."UserLocationAccess" USING btree ("LocationId");
+
+
+--
 -- Name: LocationCashAccounts_bank_unique; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4863,6 +5010,30 @@ ALTER TABLE ONLY public."ReadingSessionCashTransactions"
 
 ALTER TABLE ONLY public."TicketOuts"
     ADD CONSTRAINT "FK_TicketOuts_Customer" FOREIGN KEY ("CustomerId") REFERENCES public."Customer"("ID");
+
+
+--
+-- Name: UserLocationAccess FK_UserLocationAccess_AssignedBy; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."UserLocationAccess"
+    ADD CONSTRAINT "FK_UserLocationAccess_AssignedBy" FOREIGN KEY ("AssignedBy") REFERENCES public."Users"("ID") ON DELETE SET NULL;
+
+
+--
+-- Name: UserLocationAccess FK_UserLocationAccess_Location; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."UserLocationAccess"
+    ADD CONSTRAINT "FK_UserLocationAccess_Location" FOREIGN KEY ("LocationId") REFERENCES public."Locations"("ID") ON DELETE CASCADE;
+
+
+--
+-- Name: UserLocationAccess FK_UserLocationAccess_User; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public."UserLocationAccess"
+    ADD CONSTRAINT "FK_UserLocationAccess_User" FOREIGN KEY ("UserId") REFERENCES public."Users"("ID") ON DELETE CASCADE;
 
 
 --
@@ -5557,5 +5728,5 @@ ALTER TABLE ONLY public."Users"
 -- PostgreSQL database dump complete
 --
 
-\unrestrict LPST9jLDaoWfKdJWS8dBUc2mRZOHGvfN4WxebWk5mdo8jn6R12TMVD1CuIYJIWv
+\unrestrict KpeuMa4cxjYWEvxQLEg6QuOMWPabXD84DRPF4FSzQUHZrWstKknWmGSdS0ga6PZ
 

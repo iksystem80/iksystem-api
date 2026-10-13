@@ -1031,6 +1031,7 @@ module.exports = function (io) {
                             c."Phone" AS phone,
 
                             c."Points" AS points,
+                            c."Points" AS "matchPoints",
 
                             TO_CHAR(
                                 c."DateCreated",
@@ -1124,7 +1125,7 @@ module.exports = function (io) {
 
                             m."MachineNumber",
 
-                            cm."Points",
+                            cm."Points" AS "assignedPoints",
 
                             cm."ImageUrl"
 
@@ -1341,15 +1342,11 @@ module.exports = function (io) {
                 const machineId = Number(mycustomer.machineid)
                 const checkinId = Number(mycustomer.checkinid)
                 const locationId = Number(mycustomer.locationid)
-                const points = Number(mycustomer.points)
                 const employeeId = Number(req.authUser?.id)
 
                 if (!req.file) return res.status(400).json({ success: false, message: 'Customer photo is required.', code: 40000 })
                 if (![customerId, machineId, checkinId, locationId, employeeId].every(v => Number.isInteger(v) && v > 0))
                     return res.status(400).json({ success: false, message: 'Valid customer, machine, check-in, location and employee are required.', code: 40000 })
-                if (!Number.isFinite(points) || points < 0)
-                    return res.status(400).json({ success: false, message: 'Match points must be zero or greater.', code: 40000 })
-
                 await client.query('BEGIN')
 
                 const sessionResult = await client.query(`
@@ -1366,16 +1363,30 @@ module.exports = function (io) {
                 }
 
                 const validAssignment = await client.query(`
-                    SELECT 1
+                    SELECT c."Points"::numeric AS points
                     FROM "CheckIn" ck
                     JOIN "Customer" c ON c."ID"=ck."CustomerId"
                     JOIN "Machines" m ON m."ID"=$2 AND m.locationid=$3
-                    WHERE ck."ID"=$1 AND ck."CustomerId"=$4 AND ck."LocationId"=$3
-                    LIMIT 1`, [checkinId, machineId, locationId, customerId])
+                    WHERE ck."ID"=$1
+                      AND ck."CustomerId"=$4
+                      AND ck."LocationId"=$3
+                      AND c."locationid"=$3
+                    LIMIT 1
+                    FOR UPDATE OF c`, [checkinId, machineId, locationId, customerId])
 
                 if (!validAssignment.rowCount) {
                     await client.query('ROLLBACK')
                     return res.status(400).json({ success: false, message: 'Customer, check-in or machine is not valid for this location.', code: 40000 })
+                }
+
+                const points = Number(validAssignment.rows[0].points)
+                if (!Number.isFinite(points) || points < 0) {
+                    await client.query('ROLLBACK')
+                    return res.status(409).json({
+                        success: false,
+                        message: 'Customer Match Point is not configured correctly.',
+                        code: 40900
+                    })
                 }
 
                 const matchEligibility = await checkMatchEligibility(client, {

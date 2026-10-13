@@ -3,6 +3,10 @@ const express = require('express')
 const router = express.Router()
 
 const { pool } = require('../db')
+const {
+    emitAccessStatus,
+    emitLocationsRefresh
+} = require('../utils/realtime')
 
 const {
     authenticate,
@@ -40,6 +44,9 @@ router.get(
                         l."IsActive"
                             AS "isActive",
 
+                        l."IsSuspended"
+                            AS "isSuspended",
+
                         COUNT(
                             u."ID"
                         )::integer
@@ -62,7 +69,8 @@ router.get(
                         l."ID",
                         l."name",
                         l."CompanyId",
-                        l."IsActive"
+                        l."IsActive",
+                        l."IsSuspended"
 
                     ORDER BY
                         l."name"
@@ -190,21 +198,24 @@ router.post(
                     (
                         "name",
                         "CompanyId",
-                        "IsActive"
+                        "IsActive",
+                        "IsSuspended"
                     )
 
                     VALUES
                     (
                         $1,
                         $2,
-                        true
+                        true,
+                        false
                     )
 
                     RETURNING
                         "ID",
                         "name",
                         "CompanyId",
-                        "IsActive"
+                        "IsActive",
+                        "IsSuspended"
                     `,
                     [
                         name.trim(),
@@ -254,8 +265,50 @@ router.put(
 
             const {
                 name,
-                isActive
+                isActive,
+                isSuspended,
+                status
             } = req.body
+
+            let nextIsActive =
+                isActive !== false
+
+            let nextIsSuspended =
+                Boolean(isSuspended)
+
+            if (status) {
+                const normalizedStatus =
+                    String(status)
+                        .trim()
+                        .toLowerCase()
+
+                if (
+                    ![
+                        'active',
+                        'inactive',
+                        'suspended'
+                    ].includes(normalizedStatus)
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message:
+                            'Location status is invalid.'
+                    })
+                }
+
+                nextIsActive =
+                    normalizedStatus ===
+                    'active'
+
+                nextIsSuspended =
+                    normalizedStatus ===
+                    'suspended'
+            }
+
+            if (nextIsActive) {
+                nextIsSuspended = false
+            }
 
             const result =
                 await pool.query(
@@ -265,17 +318,23 @@ router.put(
 
                     SET
                         "name" = $1,
-                        "IsActive" = $2
+                        "IsActive" = $2,
+                        "IsSuspended" = $3
 
                     WHERE
-                        "ID" = $3
+                        "ID" = $4
 
                     RETURNING
-                        "ID"
+                        "ID" AS "id",
+                        "name" AS "name",
+                        "CompanyId" AS "companyId",
+                        "IsActive" AS "isActive",
+                        "IsSuspended" AS "isSuspended"
                     `,
                     [
                         name,
-                        isActive !== false,
+                        nextIsActive,
+                        nextIsSuspended,
                         locationId
                     ]
                 )
@@ -290,6 +349,42 @@ router.put(
                         'Location not found.'
                 })
             }
+
+            const updatedLocation =
+                result.rows[0]
+
+            const updatedStatus =
+                updatedLocation.isSuspended
+                    ? 'suspended'
+                    : updatedLocation.isActive
+                        ? 'active'
+                        : 'inactive'
+
+            if (
+                updatedStatus === 'inactive' ||
+                updatedStatus === 'suspended'
+            ) {
+                emitAccessStatus(
+                    'location',
+                    locationId,
+                    updatedStatus,
+                    updatedLocation.name,
+                    {
+                        companyId:
+                            updatedLocation.companyId
+                    }
+                )
+            }
+
+            emitLocationsRefresh(
+                updatedLocation.companyId,
+                'location-updated',
+                {
+                    locationId,
+                    status:
+                        updatedStatus
+                }
+            )
 
             return res.status(200).json({
                 success: true,
@@ -309,6 +404,197 @@ router.put(
                 code: 50000,
                 message:
                     'Unable to update location.'
+            })
+        }
+    }
+)
+
+
+// ============================================================
+// LOCATION STATUS
+// ACTIVE / INACTIVE / SUSPENDED
+// SYSTEM ADMIN ONLY
+// ============================================================
+
+router.patch(
+    '/status/:id',
+    authenticate,
+    requireSystemAdmin,
+    async (req, res) => {
+        try {
+            const locationId =
+                Number(
+                    req.params.id
+                )
+
+            const normalizedStatus =
+                String(
+                    req.body.status || ''
+                )
+                    .trim()
+                    .toLowerCase()
+
+            if (
+                !Number.isInteger(locationId) ||
+                locationId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Valid location is required.'
+                })
+            }
+
+            if (
+                ![
+                    'active',
+                    'inactive',
+                    'suspended'
+                ].includes(normalizedStatus)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Location status is invalid.'
+                })
+            }
+
+            const isActive =
+                normalizedStatus ===
+                'active'
+
+            const isSuspended =
+                normalizedStatus ===
+                'suspended'
+
+            // A location cannot be activated while its company is inactive
+            // or suspended. Inactive/suspended location changes are always allowed.
+            if (isActive) {
+                const companyState =
+                    await pool.query(
+                        `
+                        SELECT
+                            c."IsActive",
+                            COALESCE(c."IsSuspended", false) AS "IsSuspended"
+                        FROM "Locations" l
+                        INNER JOIN "Companies" c
+                          ON c."ID" = l."CompanyId"
+                        WHERE l."ID" = $1
+                        LIMIT 1
+                        `,
+                        [
+                            locationId
+                        ]
+                    )
+
+                if (!companyState.rowCount) {
+                    return res.status(404).json({
+                        success: false,
+                        code: 40400,
+                        message:
+                            'Location not found.'
+                    })
+                }
+
+                const company =
+                    companyState.rows[0]
+
+                if (
+                    company.IsActive !== true ||
+                    company.IsSuspended === true
+                ) {
+                    return res.status(409).json({
+                        success: false,
+                        code: 40900,
+                        message:
+                            'Activate the company before activating this location.'
+                    })
+                }
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE "Locations"
+                    SET
+                        "IsActive" = $1,
+                        "IsSuspended" = $2
+                    WHERE
+                        "ID" = $3
+                    RETURNING
+                        "ID" AS "id",
+                        "name" AS "name",
+                        "CompanyId" AS "companyId",
+                        "IsActive" AS "isActive",
+                        "IsSuspended" AS "isSuspended"
+                    `,
+                    [
+                        isActive,
+                        isSuspended,
+                        locationId
+                    ]
+                )
+
+            if (!result.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message:
+                        'Location not found.'
+                })
+            }
+
+            const updatedLocation =
+                result.rows[0]
+
+            if (
+                normalizedStatus === 'inactive' ||
+                normalizedStatus === 'suspended'
+            ) {
+                emitAccessStatus(
+                    'location',
+                    locationId,
+                    normalizedStatus,
+                    updatedLocation.name,
+                    {
+                        companyId:
+                            updatedLocation.companyId
+                    }
+                )
+            }
+
+            emitLocationsRefresh(
+                updatedLocation.companyId,
+                'location-status-changed',
+                {
+                    locationId,
+                    status:
+                        normalizedStatus
+                }
+            )
+
+            return res.status(200).json({
+                success: true,
+                code: 20000,
+                message:
+                    'Location status updated.',
+                data:
+                    result.rows[0]
+            })
+
+        } catch (error) {
+            console.error(
+                'Location status error:',
+                error
+            )
+
+            return res.status(500).json({
+                success: false,
+                code: 50000,
+                message:
+                    'Unable to update location status.'
             })
         }
     }

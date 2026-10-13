@@ -12,7 +12,11 @@ const roleName = req => String(req.authUser?.roleName || '').trim().toLowerCase(
 const roleManager = req => ['system admin','owner','admin'].includes(roleName(req))
 
 function locationId(req) {
-  const raw = req.query.locationid ?? req.body.locationid ?? req.authUser?.locationId
+  const raw =
+    req.query?.locationid ??
+    req.body?.locationid ??
+    req.authUser?.locationId
+
   const value = Number(raw)
   return Number.isSafeInteger(value) && value > 0 ? value : null
 }
@@ -83,20 +87,112 @@ router.get('/permissions', managerAccess, async (req, res) => {
 
 router.put('/location-modules', managerAccess, async (req, res) => {
   if (!isSystemAdmin(req)) return fail(res, 403, 'System Admin access required.')
+
   const client = await pool.connect()
+
   try {
     const loc = locationId(req)
-    if (!(await locationAllowed(req, loc))) return fail(res, 403, 'Location access denied.')
-    const moduleIds = await normalizeModuleIds(client, req.body.moduleIds)
+
+    if (!(await locationAllowed(req, loc))) {
+      return fail(res, 403, 'Location access denied.')
+    }
+
+    const moduleIds = await normalizeModuleIds(
+      client,
+      req.body?.moduleIds
+    )
+
     await client.query('BEGIN')
-    await client.query('DELETE FROM "LocationModules" WHERE "LocationId"=$1', [loc])
-    for (const moduleId of moduleIds) await client.query('INSERT INTO "LocationModules" ("LocationId","ModuleId","AssignedBy") VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [loc, moduleId, req.authUser.id])
-    // If System Admin removes a location module, remove all role assignments to it too.
-    await client.query(`DELETE FROM "LocationRoleModules" WHERE "LocationId"=$1 AND NOT ("ModuleId"=ANY($2::int[]))`, [loc, moduleIds.length ? moduleIds : [0]])
+
+    // System Admin defines the maximum module set available at this location.
+    await client.query(
+      'DELETE FROM "LocationModules" WHERE "LocationId"=$1',
+      [loc]
+    )
+
+    for (const moduleId of moduleIds) {
+      await client.query(
+        `INSERT INTO "LocationModules"
+          ("LocationId","ModuleId","AssignedBy")
+         VALUES ($1,$2,$3)
+         ON CONFLICT DO NOTHING`,
+        [loc, moduleId, req.authUser.id]
+      )
+    }
+
+    // Anything removed by System Admin must also disappear from every
+    // role assignment at this location.
+    await client.query(
+      `DELETE FROM "LocationRoleModules"
+       WHERE "LocationId"=$1
+         AND NOT ("ModuleId"=ANY($2::int[]))`,
+      [loc, moduleIds.length ? moduleIds : [0]]
+    )
+
+    // The Owner is the location-level permission administrator.
+    // Owner always receives the complete module set enabled by System Admin.
+    const ownerResult = await client.query(
+      `SELECT "ID" AS id
+       FROM "Roles"
+       WHERE LOWER(BTRIM("Name"))='owner'
+         AND "IsActive"=true
+       LIMIT 1`
+    )
+
+    if (!ownerResult.rowCount) {
+      throw new Error('Active Owner role is not configured.')
+    }
+
+    const ownerRoleId = Number(ownerResult.rows[0].id)
+
+    // Keep Owner exactly synchronized with LocationModules.
+    await client.query(
+      `DELETE FROM "LocationRoleModules"
+       WHERE "LocationId"=$1
+         AND "RoleId"=$2`,
+      [loc, ownerRoleId]
+    )
+
+    for (const moduleId of moduleIds) {
+      await client.query(
+        `INSERT INTO "LocationRoleModules"
+          ("LocationId","RoleId","ModuleId","AssignedBy")
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT DO NOTHING`,
+        [loc, ownerRoleId, moduleId, req.authUser.id]
+      )
+    }
+
     await client.query('COMMIT')
-    return ok(res, { moduleIds }, 'Location modules updated.')
-  } catch (error) { try { await client.query('ROLLBACK') } catch {} ; console.error('Update location modules:', error); return fail(res, 500, 'Unable to update location modules.') }
-  finally { client.release() }
+
+    return ok(
+      res,
+      {
+        moduleIds,
+        ownerRoleId
+      },
+      'Location modules updated and Owner permissions synchronized.'
+    )
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {}
+
+    console.error(
+      'Update location modules:',
+      error
+    )
+
+    return fail(
+      res,
+      500,
+      error.message === 'Active Owner role is not configured.'
+        ? error.message
+        : 'Unable to update location modules.'
+    )
+  } finally {
+    client.release()
+  }
 })
 
 router.get('/:id', managerAccess, async (req, res) => {

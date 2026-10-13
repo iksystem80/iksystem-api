@@ -71,8 +71,20 @@ router.post(
                         c."IsActive"
                             AS "CompanyIsActive",
 
+                        COALESCE(
+                            c."IsSuspended",
+                            false
+                        )
+                            AS "CompanyIsSuspended",
+
                         l."IsActive"
-                            AS "LocationIsActive"
+                            AS "LocationIsActive",
+
+                        COALESCE(
+                            l."IsSuspended",
+                            false
+                        )
+                            AS "LocationIsSuspended"
 
                     FROM
                         "Users" u
@@ -188,18 +200,6 @@ router.post(
                 }
 
                 if (
-                    user.LocationIsActive ===
-                    false
-                ) {
-                    return res.status(403).json({
-                        success: false,
-                        code: 40300,
-                        message:
-                            'Your assigned location is inactive.'
-                    })
-                }
-
-                if (
                     !user.CompanyId
                 ) {
                     return res.status(403).json({
@@ -211,6 +211,24 @@ router.post(
                 }
 
                 if (
+                    user.CompanyIsSuspended ===
+                    true
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is suspended.',
+                        statusType:
+                            'suspended',
+                        statusScope:
+                            'company',
+                        statusName:
+                            user.CompanyName || ''
+                    })
+                }
+
+                if (
                     user.CompanyIsActive ===
                     false
                 ) {
@@ -218,7 +236,49 @@ router.post(
                         success: false,
                         code: 40300,
                         message:
-                            'Your company is inactive.'
+                            'Your company is deactivated.',
+                        statusType:
+                            'inactive',
+                        statusScope:
+                            'company',
+                        statusName:
+                            user.CompanyName || ''
+                    })
+                }
+
+                if (
+                    user.LocationIsSuspended ===
+                    true
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your location is suspended.',
+                        statusType:
+                            'suspended',
+                        statusScope:
+                            'location',
+                        statusName:
+                            user.locationname || ''
+                    })
+                }
+
+                if (
+                    user.LocationIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your location is deactivated.',
+                        statusType:
+                            'inactive',
+                        statusScope:
+                            'location',
+                        statusName:
+                            user.locationname || ''
                     })
                 }
             }
@@ -318,7 +378,8 @@ router.get(
     async (req, res) => {
         const {
             token,
-            userid
+            userid,
+            locationid
         } = req.query
 
         if (
@@ -368,8 +429,20 @@ router.get(
                         c."IsActive"
                             AS "CompanyIsActive",
 
+                        COALESCE(
+                            c."IsSuspended",
+                            false
+                        )
+                            AS "CompanyIsSuspended",
+
                         l."IsActive"
-                            AS "LocationIsActive"
+                            AS "LocationIsActive",
+
+                        COALESCE(
+                            l."IsSuspended",
+                            false
+                        )
+                            AS "LocationIsSuspended"
 
                     FROM
                         "Users" u
@@ -449,29 +522,6 @@ router.get(
                 'system admin'
             ) {
                 if (
-                    !dbUser.LocationId
-                ) {
-                    return res.status(403).json({
-                        success: false,
-                        code: 40300,
-                        message:
-                            'Your account is not assigned to a location.'
-                    })
-                }
-
-                if (
-                    dbUser.LocationIsActive ===
-                    false
-                ) {
-                    return res.status(403).json({
-                        success: false,
-                        code: 40300,
-                        message:
-                            'Your assigned location is inactive.'
-                    })
-                }
-
-                if (
                     !dbUser.CompanyId
                 ) {
                     return res.status(403).json({
@@ -483,6 +533,24 @@ router.get(
                 }
 
                 if (
+                    dbUser.CompanyIsSuspended ===
+                    true
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is suspended.',
+                        statusType:
+                            'suspended',
+                        statusScope:
+                            'company',
+                        statusName:
+                            dbUser.CompanyName || ''
+                    })
+                }
+
+                if (
                     dbUser.CompanyIsActive ===
                     false
                 ) {
@@ -490,10 +558,197 @@ router.get(
                         success: false,
                         code: 40300,
                         message:
-                            'Your company is inactive.'
+                            'Your company is deactivated.',
+                        statusType:
+                            'inactive',
+                        statusScope:
+                            'company',
+                        statusName:
+                            dbUser.CompanyName || ''
                     })
                 }
             }
+
+// ====================================================
+            // RESOLVE EFFECTIVE LOCATION
+            // ====================================================
+            // System Admin does not require a current location.
+            // Normal company users load permissions for the selected location,
+            // falling back to their account's home/default location.
+            let effectiveLocationId = null
+            let effectiveLocation = null
+
+            if (
+                normalizedRole !==
+                'system admin'
+            ) {
+                effectiveLocationId =
+                    locationid
+                        ? Number(locationid)
+                        : Number(dbUser.LocationId || 0)
+
+                if (
+                    !Number.isInteger(effectiveLocationId) ||
+                    effectiveLocationId <= 0
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'A valid location is required.'
+                    })
+                }
+
+                const locationResult =
+                    await pool.query(
+                        `
+                        SELECT
+                            l."ID",
+                            l."name",
+                            l."CompanyId",
+                            l."AllowFaceCheckin",
+                            l."IsActive" AS "LocationIsActive",
+                            COALESCE(l."IsSuspended", false) AS "LocationIsSuspended",
+                            c."Name" AS "CompanyName",
+                            c."IsActive" AS "CompanyIsActive",
+                            COALESCE(c."IsSuspended", false) AS "CompanyIsSuspended"
+                        FROM "Locations" l
+                        INNER JOIN "Companies" c
+                          ON c."ID" = l."CompanyId"
+                        WHERE l."ID" = $1
+                        LIMIT 1
+                        `,
+                        [
+                            effectiveLocationId
+                        ]
+                    )
+
+                effectiveLocation =
+                    locationResult.rows[0] || null
+
+                if (
+                    !effectiveLocation ||
+                    Number(effectiveLocation.CompanyId) !==
+                        Number(dbUser.CompanyId)
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Location access denied.'
+                    })
+                }
+
+                // Owner can work across every location in the company.
+                // Admin can use the primary location plus explicitly assigned
+                // additional locations. Other roles stay on their primary location.
+                if (
+                    normalizedRole !== 'owner' &&
+                    Number(effectiveLocationId) !== Number(dbUser.LocationId)
+                ) {
+                    let hasAdditionalAccess = false
+
+                    if (normalizedRole === 'admin') {
+                        const accessResult = await pool.query(
+                            `
+                            SELECT 1
+                            FROM "UserLocationAccess"
+                            WHERE "UserId" = $1
+                              AND "LocationId" = $2
+                            LIMIT 1
+                            `,
+                            [
+                                Number(dbUser.ID),
+                                Number(effectiveLocationId)
+                            ]
+                        )
+
+                        hasAdditionalAccess = accessResult.rowCount > 0
+                    }
+
+                    if (!hasAdditionalAccess) {
+                        return res.status(403).json({
+                            success: false,
+                            code: 40300,
+                            message:
+                                'You do not have access to this location.'
+                        })
+                    }
+                }
+
+                if (
+                    effectiveLocation.CompanyIsSuspended ===
+                    true
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is suspended.',
+                        statusType:
+                            'suspended',
+                        statusScope:
+                            'company',
+                        statusName:
+                            effectiveLocation.CompanyName || ''
+                    })
+                }
+
+                if (
+                    effectiveLocation.CompanyIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your company is deactivated.',
+                        statusType:
+                            'inactive',
+                        statusScope:
+                            'company',
+                        statusName:
+                            effectiveLocation.CompanyName || ''
+                    })
+                }
+
+                if (
+                    effectiveLocation.LocationIsSuspended ===
+                    true
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your location is suspended.',
+                        statusType:
+                            'suspended',
+                        statusScope:
+                            'location',
+                        statusName:
+                            effectiveLocation.name || ''
+                    })
+                }
+
+                if (
+                    effectiveLocation.LocationIsActive ===
+                    false
+                ) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 40300,
+                        message:
+                            'Your location is deactivated.',
+                        statusType:
+                            'inactive',
+                        statusScope:
+                            'location',
+                        statusName:
+                            effectiveLocation.name || ''
+                    })
+                }
+            }
+
             // ====================================================
             // LOAD LOCATION + ROLE MODULE ACCESS
             // CRUD permissions are no longer used. The frontend keeps the
@@ -516,7 +771,7 @@ router.get(
                       ON m."ID"=lrm."ModuleId" AND m."IsActive"=true
                     WHERE lrm."LocationId"=$1
                       AND lrm."RoleId"=$2
-                    ORDER BY m."SortOrder",m."Code"`, [dbUser.LocationId, dbUser.RoleId])
+                    ORDER BY m."SortOrder",m."Code"`, [effectiveLocationId, dbUser.RoleId])
             }
             const permissions = permissionResult.rows.map(row => row.code)
 // ====================================================
@@ -525,8 +780,9 @@ router.get(
             // System Admin:
             //   all company locations
             //
-            // Other roles:
-            //   only locations in their own company
+            // Owner: all company locations
+            // Admin: primary + explicitly assigned locations
+            // Other roles: primary location only
             // ====================================================
 
             let resultLoc
@@ -562,12 +818,19 @@ router.get(
                             l."IsActive" = true
 
                             AND
+
+                            COALESCE(l."IsSuspended", false) = false
+
+                            AND
                             (
                                 c."ID" IS NULL
 
                                 OR
-
-                                c."IsActive" = true
+                                (
+                                    c."IsActive" = true
+                                    AND
+                                    COALESCE(c."IsSuspended", false) = false
+                                )
                             )
 
                         ORDER BY
@@ -576,6 +839,65 @@ router.get(
                         `
                     )
 
+            } else if (normalizedRole === 'owner') {
+                resultLoc =
+                    await pool.query(
+                        `
+                        SELECT
+                            l."ID",
+                            l."name",
+                            l."IsActive",
+                            l."CompanyId",
+                            l."AllowFaceCheckin" AS "AllowFaceCheckin",
+                            c."Name" AS "companyName"
+                        FROM "Locations" l
+                        INNER JOIN "Companies" c
+                          ON c."ID" = l."CompanyId"
+                        WHERE l."CompanyId" = $1
+                          AND l."IsActive" = true
+                          AND COALESCE(l."IsSuspended", false) = false
+                          AND c."IsActive" = true
+                          AND COALESCE(c."IsSuspended", false) = false
+                        ORDER BY l."name"
+                        `,
+                        [dbUser.CompanyId]
+                    )
+            } else if (normalizedRole === 'admin') {
+                resultLoc =
+                    await pool.query(
+                        `
+                        SELECT DISTINCT
+                            l."ID",
+                            l."name",
+                            l."IsActive",
+                            l."CompanyId",
+                            l."AllowFaceCheckin" AS "AllowFaceCheckin",
+                            c."Name" AS "companyName"
+                        FROM "Locations" l
+                        INNER JOIN "Companies" c
+                          ON c."ID" = l."CompanyId"
+                        WHERE l."CompanyId" = $1
+                          AND (
+                                l."ID" = $2
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM "UserLocationAccess" ula
+                                    WHERE ula."UserId" = $3
+                                      AND ula."LocationId" = l."ID"
+                                )
+                              )
+                          AND l."IsActive" = true
+                          AND COALESCE(l."IsSuspended", false) = false
+                          AND c."IsActive" = true
+                          AND COALESCE(c."IsSuspended", false) = false
+                        ORDER BY l."name"
+                        `,
+                        [
+                            dbUser.CompanyId,
+                            dbUser.LocationId,
+                            dbUser.ID
+                        ]
+                    )
             } else {
                 resultLoc =
                     await pool.query(
@@ -585,36 +907,21 @@ router.get(
                             l."name",
                             l."IsActive",
                             l."CompanyId",
-                            l."AllowFaceCheckin"
-                            AS "AllowFaceCheckin",
-                            c."Name"
-                                AS "companyName"
-
-                        FROM
-                            "Locations" l
-
-                        INNER JOIN
-                            "Companies" c
-
-                            ON
-                                c."ID" =
-                                    l."CompanyId"
-
-                        WHERE
-                            l."CompanyId" = $1
-
-                            AND
-
-                            l."IsActive" = true
-
-                            AND
-
-                            c."IsActive" = true
-
-                        ORDER BY
-                            l."name"
+                            l."AllowFaceCheckin" AS "AllowFaceCheckin",
+                            c."Name" AS "companyName"
+                        FROM "Locations" l
+                        INNER JOIN "Companies" c
+                          ON c."ID" = l."CompanyId"
+                        WHERE l."ID" = $1
+                          AND l."CompanyId" = $2
+                          AND l."IsActive" = true
+                          AND COALESCE(l."IsSuspended", false) = false
+                          AND c."IsActive" = true
+                          AND COALESCE(c."IsSuspended", false) = false
+                        LIMIT 1
                         `,
                         [
+                            dbUser.LocationId,
                             dbUser.CompanyId
                         ]
                     )
@@ -656,13 +963,27 @@ router.get(
                         dbUser.CompanyName || '',
 
                     locationid:
-                        dbUser.LocationId,
+                        normalizedRole === 'system admin'
+                            ? null
+                            : effectiveLocationId,
 
                     location:
-                        dbUser.locationname || '',
+                        normalizedRole === 'system admin'
+                            ? ''
+                            : (
+                                effectiveLocation?.name ||
+                                dbUser.locationname ||
+                                ''
+                            ),
 
                     allowfacecheckin:
-                        dbUser.AllowFaceCheckin
+                        normalizedRole === 'system admin'
+                            ? false
+                            : (
+                                effectiveLocation
+                                    ? Boolean(effectiveLocation.AllowFaceCheckin)
+                                    : Boolean(dbUser.AllowFaceCheckin)
+                            )
                 },
 
                 locations:

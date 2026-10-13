@@ -44,15 +44,47 @@ const io = new Server(httpServer, {
   },
 })
 
+const { setSocketIO } = require('./utils/realtime')
+setSocketIO(io)
+
 // ============================================
 // Socket.IO connection
 // ============================================
 
 io.on('connection', (socket) => {
   socket.on('join-location', (locationId) => {
-    const location = `location-${locationId}`
+    const id = Number(locationId)
 
-    socket.join(location)
+    if (Number.isSafeInteger(id) && id > 0) {
+      socket.join(`location-${id}`)
+    }
+  })
+
+  socket.on('join-user-context', ({ locationId, companyId } = {}) => {
+    // A user may switch locations without opening a new socket. Remove any
+    // previous company/location rooms before joining the newly selected context.
+    for (const room of socket.rooms) {
+      if (
+        room !== socket.id &&
+        (
+          room.startsWith('location-') ||
+          room.startsWith('company-')
+        )
+      ) {
+        socket.leave(room)
+      }
+    }
+
+    const location = Number(locationId)
+    const company = Number(companyId)
+
+    if (Number.isSafeInteger(location) && location > 0) {
+      socket.join(`location-${location}`)
+    }
+
+    if (Number.isSafeInteger(company) && company > 0) {
+      socket.join(`company-${company}`)
+    }
   })
 })
 

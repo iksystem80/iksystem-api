@@ -529,6 +529,9 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
 
             const close = lastAdminShiftClose.rows[0]
 
+            let sourceAccountId = null
+            let sourceNote = null
+
             if (close) {
                 const firstSessionAfterClose = await client.query(`
                     SELECT es."ID" AS id
@@ -543,57 +546,99 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
                     Number(firstSessionAfterClose.rows[0]?.id) === Number(s.ID)
 
                 if (isFirstSessionAfterShiftClose) {
-                    const custody = await client.query(`
-                        SELECT
-                            COALESCE(SUM(e."Amount"),0)::numeric(14,2) AS balance,
-                            (
-                                COALESCE((
-                                    SELECT SUM(t."Amount")
-                                    FROM "LocationCashTransfers" t
-                                    WHERE t."FromAccountId"=$1
-                                      AND t."Status"='Pending'
-                                ),0)
-                                +
-                                COALESCE((
-                                    SELECT SUM(f."Amount")
-                                    FROM "AdminCashFunding" f
-                                    WHERE f."CustodySourceAccountId"=$1
-                                      AND f."Status"='Pending'
-                                ),0)
-                            )::numeric(14,2) AS reserved
-                        FROM "LocationCashEntries" e
-                        WHERE e."AccountId"=$1`,
-                        [close.accountId])
-
-                    const balance = Number(custody.rows[0]?.balance || 0)
-                    const reserved = Number(custody.rows[0]?.reserved || 0)
-                    const available = balance - reserved
-
-                    if (available < Number(amount)) {
-                        await client.query('ROLLBACK')
-                        return fail(
-                            res,
-                            409,
-                            `Admin available balance is insufficient for this Opening Bank. Available: $${available.toFixed(2)}.`
-                        )
-                    }
-
-                    await client.query(`
-                        INSERT INTO "LocationCashEntries"
-                            ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes")
-                        VALUES ($1,$2,$3,'EMPLOYEE_SUPPORT',$4,$5)`,
-                        [
-                            s.LocationId,
-                            close.accountId,
-                            -Number(amount),
-                            s.UserId,
-                            `Opening Bank released to employee session #${s.ID} · first session after last shift close`
-                        ])
-
-                    adminDeducted = true
-                    adminDeductedAmount = Number(amount)
+                    sourceAccountId = Number(close.accountId)
                     sourceAdminUserId = close.adminUserId ? Number(close.adminUserId) : null
+                    sourceNote = `Opening Bank released to employee session #${s.ID} · first session after last shift close`
                 }
+            } else {
+                // First-location / pre-rollover case:
+                // there is no prior EMPLOYEE_CASH_TAKEN marker yet, so resolve the
+                // location's primary Admin custody account directly.
+                const primaryAdmin = await client.query(`
+                    SELECT
+                        a."ID" AS "accountId",
+                        a."UserId" AS "adminUserId"
+                    FROM "LocationCashAccounts" a
+                    JOIN "Users" u
+                      ON u."ID"=a."UserId"
+                    JOIN "Roles" r
+                      ON r."ID"=u."RoleId"
+                    WHERE a."LocationId"=$1
+                      AND a."Kind"='ADMIN'
+                      AND u."LocationId"=$1
+                      AND COALESCE(u."IsActive",true)=true
+                      AND LOWER(BTRIM(r."Name"))='admin'
+                    ORDER BY a."ID" ASC
+                    LIMIT 1
+                    FOR UPDATE OF a`,
+                    [s.LocationId])
+
+                const firstLocationAdmin = primaryAdmin.rows[0]
+
+                if (!firstLocationAdmin) {
+                    await client.query('ROLLBACK')
+                    return fail(
+                        res,
+                        409,
+                        'Opening Bank cannot be released because this location does not have a funded primary Admin cash account.'
+                    )
+                }
+
+                sourceAccountId = Number(firstLocationAdmin.accountId)
+                sourceAdminUserId = Number(firstLocationAdmin.adminUserId)
+                sourceNote = `Opening Bank released to employee session #${s.ID} · first location opening before any prior shift close`
+            }
+
+            if (sourceAccountId) {
+                const custody = await client.query(`
+                    SELECT
+                        COALESCE(SUM(e."Amount"),0)::numeric(14,2) AS balance,
+                        (
+                            COALESCE((
+                                SELECT SUM(t."Amount")
+                                FROM "LocationCashTransfers" t
+                                WHERE t."FromAccountId"=$1
+                                  AND t."Status"='Pending'
+                            ),0)
+                            +
+                            COALESCE((
+                                SELECT SUM(f."Amount")
+                                FROM "AdminCashFunding" f
+                                WHERE f."CustodySourceAccountId"=$1
+                                  AND f."Status"='Pending'
+                            ),0)
+                        )::numeric(14,2) AS reserved
+                    FROM "LocationCashEntries" e
+                    WHERE e."AccountId"=$1`,
+                    [sourceAccountId])
+
+                const balance = Number(custody.rows[0]?.balance || 0)
+                const reserved = Number(custody.rows[0]?.reserved || 0)
+                const available = balance - reserved
+
+                if (available < Number(amount)) {
+                    await client.query('ROLLBACK')
+                    return fail(
+                        res,
+                        409,
+                        `Admin available balance is insufficient for this Opening Bank. Available: $${available.toFixed(2)}.`
+                    )
+                }
+
+                await client.query(`
+                    INSERT INTO "LocationCashEntries"
+                        ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes")
+                    VALUES ($1,$2,$3,'EMPLOYEE_SUPPORT',$4,$5)`,
+                    [
+                        s.LocationId,
+                        sourceAccountId,
+                        -Number(amount),
+                        s.UserId,
+                        sourceNote
+                    ])
+
+                adminDeducted = true
+                adminDeductedAmount = Number(amount)
             }
         }
 
@@ -604,6 +649,19 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
             [s.ID, s.LocationId, amount, note(req.body.notes), s.UserId])
 
         await client.query('COMMIT')
+
+        emitAppRefresh(
+            s.LocationId,
+            ['adminTransactions'],
+            'employee-opening-bank',
+            {
+                sessionId: s.ID,
+                userId: s.UserId,
+                adminDeducted,
+                adminDeductedAmount,
+                sourceAdminUserId
+            }
+        )
 
         return ok(res, {
             adminDeducted,
@@ -656,7 +714,20 @@ router.post('/transaction', requireModuleAccess('transaction.employee'), async (
         await client.query(`INSERT INTO "SessionCashTransactions"
             ("SessionId","LocationId","Type","Amount","ExpenseTypeId","CreditTypeId","Notes","CreatedBy")
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [s.ID, s.LocationId, type, amount, expenseTypeId, creditTypeId, note(req.body.notes), s.UserId])
-        await client.query('COMMIT'); return ok(res, null, 'Transaction recorded.')
+        await client.query('COMMIT')
+
+        emitAppRefresh(
+            s.LocationId,
+            ['adminTransactions'],
+            type === 'CASH_RECEIVED' ? 'employee-add-bank' : 'employee-expense',
+            {
+                sessionId: s.ID,
+                userId: s.UserId,
+                type
+            }
+        )
+
+        return ok(res, null, 'Transaction recorded.')
     } catch (e) { await client.query('ROLLBACK'); console.error('Finance transaction:', e); return fail(res, 500, 'Unable to record transaction.') }
     finally { client.release() }
 })
