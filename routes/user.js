@@ -1,9 +1,12 @@
 const express = require('express')
 const bcrypt = require('bcryptjs')
+const multer = require('multer')
 
 const router = express.Router()
 
 const { pool } = require('../db')
+const cloudinary = require('../config/cloudinary')
+const { authenticate } = require('../middleware/auth')
 
 // ============================================================
 // HELPERS
@@ -17,6 +20,44 @@ function normalizeRoleName(value = '') {
     return String(value)
         .trim()
         .toLowerCase()
+}
+
+const profileUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 5 * 1024 * 1024
+    },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true)
+        } else {
+            cb(
+                new Error('Only images are allowed!'),
+                false
+            )
+        }
+    }
+})
+
+function uploadProfileImage(fileBuffer) {
+    return new Promise((resolve, reject) => {
+        const uploadStream =
+            cloudinary.uploader.upload_stream(
+                {
+                    folder: 'users',
+                    resource_type: 'image'
+                },
+                (error, result) => {
+                    if (error) {
+                        reject(error)
+                    } else {
+                        resolve(result)
+                    }
+                }
+            )
+
+        uploadStream.end(fileBuffer)
+    })
 }
 
 // ============================================================
@@ -405,6 +446,7 @@ router.get(
                     `
                     SELECT
                         u."ID",
+                        u."Username",
                         u."Name",
                         u."token",
                         u."Avatar",
@@ -950,6 +992,9 @@ router.get(
 
                     permissions,
 
+                    username:
+                        dbUser.Username || '',
+
                     avatar:
                         dbUser.Avatar || '',
 
@@ -1002,6 +1047,293 @@ router.get(
                 message:
                     'Internal server error. ' +
                     err.message
+            })
+        }
+    }
+)
+
+
+// ============================================================
+// MY PROFILE
+// Authenticated user may update only their own name + avatar.
+// Username / role / location / status are intentionally not editable here.
+// ============================================================
+
+router.put(
+    '/profile',
+    authenticate,
+    profileUpload.single('avatar'),
+    async (req, res) => {
+        try {
+            const userId =
+                Number(req.authUser?.id)
+
+            const name =
+                String(req.body?.name || '')
+                    .trim()
+
+            if (
+                !Number.isInteger(userId) ||
+                userId <= 0
+            ) {
+                return res.status(401).json({
+                    success: false,
+                    code: 40100,
+                    message:
+                        'Authenticated user is required.'
+                })
+            }
+
+            if (!name) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Name is required.'
+                })
+            }
+
+            let avatar = null
+
+            if (req.file) {
+                const uploadResult =
+                    await uploadProfileImage(
+                        req.file.buffer
+                    )
+
+                avatar =
+                    uploadResult.secure_url
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE "Users"
+                    SET
+                        "Name" = $1,
+                        "Avatar" =
+                            CASE
+                                WHEN $2::text IS NULL
+                                    THEN "Avatar"
+                                ELSE $2
+                            END,
+                        "DateUpdated" = NOW()
+                    WHERE
+                        "ID" = $3
+                        AND "IsActive" = true
+                    RETURNING
+                        "ID" AS id,
+                        "Username" AS username,
+                        "Name" AS name,
+                        "Avatar" AS avatar
+                    `,
+                    [
+                        name,
+                        avatar,
+                        userId
+                    ]
+                )
+
+            if (!result.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message:
+                        'User account was not found.'
+                })
+            }
+
+            return res.status(200).json({
+                success: true,
+                code: 20000,
+                message:
+                    'Profile updated successfully.',
+                data:
+                    result.rows[0]
+            })
+
+        } catch (error) {
+            console.error(
+                'Update profile error:',
+                error
+            )
+
+            if (
+                error?.code ===
+                'LIMIT_FILE_SIZE'
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Avatar image must be 5 MB or smaller.'
+                })
+            }
+
+            return res.status(500).json({
+                success: false,
+                code: 50000,
+                message:
+                    'Unable to update profile.'
+            })
+        }
+    }
+)
+
+// ============================================================
+// CHANGE MY PASSWORD
+// Current password is required. Username is never changed here.
+// ============================================================
+
+router.put(
+    '/profile/password',
+    authenticate,
+    async (req, res) => {
+        try {
+            const userId =
+                Number(req.authUser?.id)
+
+            const currentPassword =
+                String(
+                    req.body?.currentPassword ||
+                    ''
+                )
+
+            const newPassword =
+                String(
+                    req.body?.newPassword ||
+                    ''
+                )
+
+            if (
+                !Number.isInteger(userId) ||
+                userId <= 0
+            ) {
+                return res.status(401).json({
+                    success: false,
+                    code: 40100,
+                    message:
+                        'Authenticated user is required.'
+                })
+            }
+
+            if (
+                !currentPassword ||
+                !newPassword
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Current password and new password are required.'
+                })
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        "Password"
+                    FROM
+                        "Users"
+                    WHERE
+                        "ID" = $1
+                        AND "IsActive" = true
+                    LIMIT 1
+                    `,
+                    [
+                        userId
+                    ]
+                )
+
+            if (!result.rowCount) {
+                return res.status(404).json({
+                    success: false,
+                    code: 40400,
+                    message:
+                        'User account was not found.'
+                })
+            }
+
+            const storedPassword =
+                result.rows[0].Password
+
+            const validCurrentPassword =
+                looksLikeBcrypt(storedPassword)
+                    ? await bcrypt.compare(
+                        currentPassword,
+                        storedPassword
+                    )
+                    : currentPassword ===
+                        storedPassword
+
+            if (!validCurrentPassword) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'Current password is incorrect.'
+                })
+            }
+
+            const samePassword =
+                looksLikeBcrypt(storedPassword)
+                    ? await bcrypt.compare(
+                        newPassword,
+                        storedPassword
+                    )
+                    : newPassword ===
+                        storedPassword
+
+            if (samePassword) {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message:
+                        'New password must be different from the current password.'
+                })
+            }
+
+            const passwordHash =
+                await bcrypt.hash(
+                    newPassword,
+                    10
+                )
+
+            await pool.query(
+                `
+                UPDATE
+                    "Users"
+                SET
+                    "Password" = $1,
+                    "DateUpdated" = NOW()
+                WHERE
+                    "ID" = $2
+                `,
+                [
+                    passwordHash,
+                    userId
+                ]
+            )
+
+            return res.status(200).json({
+                success: true,
+                code: 20000,
+                message:
+                    'Password updated successfully.'
+            })
+
+        } catch (error) {
+            console.error(
+                'Change password error:',
+                error
+            )
+
+            return res.status(500).json({
+                success: false,
+                code: 50000,
+                message:
+                    'Unable to update password.'
             })
         }
     }

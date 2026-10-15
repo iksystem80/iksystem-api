@@ -592,6 +592,7 @@ module.exports = function (io) {
                             "Firstname" AS firstname,
                             "Lastname" AS lastname,
                             "Phone" AS phone,
+                            "avatar" AS avatar,
                             "IsActive" AS isactive,
                             "IsBlacklist" AS isblacklist,
                             "PhoneVerified" AS phoneverified,
@@ -714,6 +715,7 @@ module.exports = function (io) {
                             "Firstname" AS firstname,
                             "Lastname" AS lastname,
                             "Phone" AS phone,
+                            "avatar" AS avatar,
                             "IsActive" AS isactive,
                             "IsBlacklist" AS isblacklist,
                             "PhoneVerified" AS phoneverified,
@@ -854,6 +856,12 @@ module.exports = function (io) {
                         message:
                             'Checkin successful!',
                         code: 20000,
+                        data: {
+                            id: customer.id,
+                            firstname: customer.firstname,
+                            lastname: customer.lastname,
+                            avatar: customer.avatar || null,
+                        },
                     })
 
             } catch (error) {

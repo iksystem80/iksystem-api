@@ -1710,6 +1710,173 @@ router.post('/admin/reading-session-credit', requireModuleAccess(["transaction.a
 })
 
 
+// Current Employee Money Trail used by AdminTransactions.vue.
+// Shows every employee session at this location that has not yet been assigned
+// to a Reading Session. This is the live bridge between Employee Transactions
+// and the later Reading Session / Weekly Report lifecycle.
+router.get('/admin/current-money-trail', requireModuleAccess('transaction.employee'), async (req, res) => {
+    try {
+        if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
+            return fail(res, 403, 'Admin access required.')
+
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId)))
+            return fail(res, 403, 'Location access denied.')
+
+        const result = await pool.query(`
+            SELECT
+                es."ID" AS id,
+                es."UserId" AS "employeeId",
+                COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
+                es."ClockIn" AS "clockIn",
+                es."ClockOut" AS "clockOut",
+                CASE
+                    WHEN es."ClockOut" IS NULL THEN 'ACTIVE'
+                    ELSE 'CLOSED'
+                END AS status,
+
+                cash.opening,
+                cash.received,
+                cash."transferOut",
+                cash."cashExpenses",
+                cash."ownerWithdrawals",
+
+                points."pointsExpense",
+                raffle."raffleExpense",
+                ticket."ticketOutExpense",
+                bonus."bonusExpense",
+                luckybird."luckyBirdExpense",
+
+                (
+                    cash."cashExpenses"
+                    + points."pointsExpense"
+                    + raffle."raffleExpense"
+                    + ticket."ticketOutExpense"
+                    + bonus."bonusExpense"
+                    + luckybird."luckyBirdExpense"
+                )::numeric(14,2) AS expenses,
+
+                (
+                    cash.opening
+                    + cash.received
+                    - cash."transferOut"
+                    - cash."cashExpenses"
+                    - points."pointsExpense"
+                    - raffle."raffleExpense"
+                    - ticket."ticketOutExpense"
+                    - bonus."bonusExpense"
+                    - luckybird."luckyBirdExpense"
+                    - cash."ownerWithdrawals"
+                )::numeric(14,2) AS "calculatedBalance",
+
+                c."ClosingBalance"::numeric(14,2) AS "closingBalance",
+                c."ActualCash"::numeric(14,2) AS "actualCash",
+                c."Variance"::numeric(14,2) AS variance,
+
+                h."ID" AS "handoverId",
+                h."Status" AS "handoverStatus",
+                h."Amount"::numeric(14,2) AS "handoverAmount",
+                h."ToUserId" AS "recipientId",
+                COALESCE(NULLIF(BTRIM(to_user."Name"),''),to_user."Username") AS "recipientName",
+
+                CASE
+                    WHEN es."ClockOut" IS NULL THEN 'HOLDING'
+                    WHEN h."ID" IS NOT NULL AND h."Status"='Pending' THEN 'EMPLOYEE_PENDING'
+                    WHEN h."ID" IS NOT NULL AND h."Status"='Accepted' THEN 'EMPLOYEE_ACCEPTED'
+                    WHEN c."SessionId" IS NOT NULL AND h."ID" IS NULL THEN 'ADMIN_CUSTODY'
+                    ELSE 'CLOSED'
+                END AS "destinationType",
+
+                CASE
+                    WHEN es."ClockOut" IS NULL THEN 'Holding'
+                    WHEN h."ID" IS NOT NULL AND h."Status"='Pending'
+                        THEN CONCAT('→ ',COALESCE(NULLIF(BTRIM(to_user."Name"),''),to_user."Username",'Employee'),' · Pending')
+                    WHEN h."ID" IS NOT NULL AND h."Status"='Accepted'
+                        THEN CONCAT('→ ',COALESCE(NULLIF(BTRIM(to_user."Name"),''),to_user."Username",'Employee'),' · Accepted')
+                    WHEN c."SessionId" IS NOT NULL AND h."ID" IS NULL THEN '→ Admin custody'
+                    ELSE 'Closed'
+                END AS destination
+
+            FROM "EmployeeSession" es
+            JOIN "Users" u
+              ON u."ID"=es."UserId"
+
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(SUM(t."Amount") FILTER (
+                        WHERE t."Type" IN ('OPENING','OPENING_TRANSFER')
+                    ),0)::numeric(14,2) AS opening,
+                    COALESCE(SUM(t."Amount") FILTER (
+                        WHERE t."Type" IN ('CASH_RECEIVED','TRANSFER_IN')
+                    ),0)::numeric(14,2) AS received,
+                    COALESCE(SUM(t."Amount") FILTER (
+                        WHERE t."Type"='TRANSFER_OUT'
+                    ),0)::numeric(14,2) AS "transferOut",
+                    COALESCE(SUM(t."Amount") FILTER (
+                        WHERE t."Type"='EXPENSE'
+                    ),0)::numeric(14,2) AS "cashExpenses",
+                    COALESCE(SUM(t."Amount") FILTER (
+                        WHERE t."Type"='OWNER_WITHDRAWAL'
+                    ),0)::numeric(14,2) AS "ownerWithdrawals"
+                FROM "SessionCashTransactions" t
+                WHERE t."SessionId"=es."ID"
+                  AND t."LocationId"=es."LocationId"
+            ) cash ON TRUE
+
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(cm."Points"),0)::numeric(14,2) AS "pointsExpense"
+                FROM "CustomerMatch" cm
+                WHERE ${pointsWindow('es', 'cm')}
+            ) points ON TRUE
+
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(r."WinningAmount"),0)::numeric(14,2) AS "raffleExpense"
+                FROM "Raffles" r
+                WHERE r."EmployeeSessionId"=es."ID"
+                  AND r."Status"='WINNER'
+            ) raffle ON TRUE
+
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(tk."Amount"),0)::numeric(14,2) AS "ticketOutExpense"
+                FROM "TicketOuts" tk
+                WHERE tk."EmployeeSessionId"=es."ID"
+            ) ticket ON TRUE
+
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(b."Amount"),0)::numeric(14,2) AS "bonusExpense"
+                FROM "BonusAwards" b
+                WHERE b."EmployeeSessionId"=es."ID"
+            ) bonus ON TRUE
+
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(lb."Amount"),0)::numeric(14,2) AS "luckyBirdExpense"
+                FROM "LuckyBirdAwards" lb
+                WHERE lb."EmployeeSessionId"=es."ID"
+            ) luckybird ON TRUE
+
+            LEFT JOIN "SessionCashClosings" c
+              ON c."SessionId"=es."ID"
+
+            LEFT JOIN "SessionCashHandovers" h
+              ON h."ID"=c."HandoverId"
+
+            LEFT JOIN "Users" to_user
+              ON to_user."ID"=h."ToUserId"
+
+            WHERE es."LocationId"=$1
+              AND es."ReadingSessionId" IS NULL
+
+            ORDER BY es."ClockIn" ASC, es."ID" ASC
+        `, [locationId])
+
+        return ok(res, result.rows)
+    } catch (e) {
+        console.error('Admin current employee money trail:', e)
+        return fail(res, 500, 'Unable to load current employee money trail.')
+    }
+})
+
+
 // Admin live cash ledger used by AdminTransactions.vue.
 // Returns only the signed-in Admin's custody account entries.
 router.get('/admin/cash-ledger', requireModuleAccess('transaction.employee'), async (req, res) => {
