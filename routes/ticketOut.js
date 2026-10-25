@@ -1,8 +1,10 @@
 const express = require('express')
 const multer = require('multer')
 const { pool } = require('../db')
+const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
+const { validateImageUpload } = require('../utils/validateImageUpload')
 const { requireModuleAccess } = require('../utils/moduleAccess')
-const cloudinary = require('../config/cloudinary')
+const { uploadBuffer } = require('../utils/imageStorage')
 const { authenticate } = require('../middleware/auth')
 
 const router = express.Router()
@@ -38,22 +40,35 @@ const money = value => {
     return amount > 0 ? amount.toFixed(2) : null
 }
 
-const uploadImage = buffer => new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-        { folder: 'ticket-out', resource_type: 'image' },
-        (error, result) => error ? reject(error) : resolve(result)
-    )
-    stream.end(buffer)
-})
+const uploadImage = async buffer => {
+  const cloudinaryBuffer = await optimizeImageUpload(buffer)
+  return uploadBuffer(cloudinaryBuffer, { folder: 'ticket-out' })
+}
 
 async function activeSession(db, req, lock = false) {
     const result = await db.query(`
     SELECT es."ID", es."UserId", es."LocationId", es."ClockIn"
     FROM "EmployeeSession" es
+    JOIN "Locations" l ON l."ID" = es."LocationId"
+    JOIN "Users" u ON u."ID" = es."UserId"
     WHERE es."UserId"=$1 AND es."ClockOut" IS NULL
+      AND (
+        $2 = 'system admin'
+        OR (l."CompanyId" = $3 AND (
+          $2 = 'owner'
+          OR u."LocationId" = es."LocationId"
+          OR ($2 = 'admin' AND EXISTS (
+            SELECT 1 FROM "UserLocationAccess" ula
+            WHERE ula."UserId" = u."ID"
+              AND ula."LocationId" = es."LocationId"
+          ))
+        ))
+      )
     ORDER BY es."ClockIn" DESC
     LIMIT 1 ${lock ? 'FOR UPDATE OF es' : ''}`,
-        [Number(req.authUser.id)])
+        [Number(req.authUser.id),
+         String(req.authUser.roleName || '').trim().toLowerCase(),
+         Number(req.authUser.companyId) || 0])
 
     return result.rows[0] || null
 }
@@ -148,6 +163,7 @@ router.get('/machine', requireModuleAccess('ticketout'), async (req, res) => {
       LEFT JOIN "MachineStatus" ms ON ms."ID"=m."StatusId"
       WHERE m.locationid=$1
         AND m."MachineNumber"::text=$2
+        AND COALESCE(m."IsArchived",false)=false
       LIMIT 1`,
             [session.LocationId, machineNumber])
 
@@ -166,6 +182,7 @@ router.post(
     '/save',
     requireModuleAccess('ticketout'),
     upload.single('image'),
+    validateImageUpload,
     async (req, res) => {
         const client = await pool.connect()
 
@@ -204,6 +221,7 @@ router.post(
         FROM "Machines"
         WHERE "ID"=$1
           AND locationid=$2
+          AND COALESCE("IsArchived",false)=false
         FOR UPDATE`,
                 [machineId, session.LocationId])
 

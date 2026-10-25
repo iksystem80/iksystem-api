@@ -9,9 +9,17 @@ const pool = new Pool({
     port: Number(process.env.PG_PORT || 5432),
     database: process.env.PG_DATABASE,
 
+    // When TLS is enabled, verify the PostgreSQL server certificate.
+    // PG_SSL_CA may hold a PEM certificate (including escaped newlines).
+    // If unset, Node.js verifies using its trusted CA certificates.
     ssl:
         process.env.PG_SSL === 'true'
-            ? { rejectUnauthorized: false }
+            ? {
+                rejectUnauthorized: true,
+                ...(process.env.PG_SSL_CA
+                    ? { ca: process.env.PG_SSL_CA.replace(/\\n/g, '\n') }
+                    : {}),
+            }
             : false,
 
     max: 20,
@@ -25,14 +33,6 @@ pool.on('connect', () => {
 pool.on('error', (err) => {
     console.error('Unexpected PostgreSQL pool error:', err);
 });
-
-// pool.query(`SELECT current_database() AS database, current_user AS db_user`)
-//     .then((result) => {
-//         console.log('RENDER DATABASE CHECK:', result.rows[0]);
-//     })
-//     .catch((err) => {
-//         console.error('RENDER DATABASE ERROR:', err.message);
-//     });
 
 module.exports = {
     pool,

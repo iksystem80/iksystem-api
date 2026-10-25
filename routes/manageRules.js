@@ -1,9 +1,50 @@
 const express = require('express')
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
+const { authenticate } = require('../middleware/auth')
 
 module.exports = function () {
     const router = express.Router()
+    router.use(authenticate)
+
+    async function requireLocationAccess(req, res, next) {
+        const locationId = Number(req.method === 'GET' ? req.query.locationid : req.body?.locationid)
+        if (!Number.isSafeInteger(locationId) || locationId <= 0) {
+            return res.status(400).json({ success: false, code: 40000, message: 'Valid location id is required.' })
+        }
+        try {
+            const location = await pool.query(`SELECT "CompanyId" FROM "Locations" WHERE "ID"=$1 LIMIT 1`, [locationId])
+            if (!location.rowCount) {
+                return res.status(404).json({ success: false, code: 40400, message: 'Location not found.' })
+            }
+            const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+            if (role !== 'system admin') {
+                if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                    return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+                }
+                if (role !== 'owner') {
+                    const access = await pool.query(`
+                        SELECT 1 FROM "Users" u WHERE u."ID"=$1
+                          AND COALESCE(u."IsActive",true)=true
+                          AND (u."LocationId"=$2 OR ($3='admin' AND EXISTS (
+                            SELECT 1 FROM "UserLocationAccess" ula
+                            WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+                          ))) LIMIT 1
+                    `, [req.authUser.id, locationId, role])
+                    if (!access.rowCount) {
+                        return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+                    }
+                }
+            }
+            return next()
+        } catch (error) {
+            console.error('Manage rules location authorization:', error)
+            return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify location access.' })
+        }
+    }
+
+    const nonnegativeInteger = value =>
+        Number.isSafeInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 2147483647
 
     function parseBoolean(value) {
         return value === true || value === 'true' || value === 1 || value === '1'
@@ -59,6 +100,7 @@ module.exports = function () {
     router.get(
         '/get',
         requireModuleAccess('settings.manage-rules'),
+        requireLocationAccess,
         async (req, res) => {
             try {
                 const locationId = Number(req.query.locationid)
@@ -111,10 +153,11 @@ module.exports = function () {
     router.put(
         '/update',
         requireModuleAccess('settings.manage-rules'),
+        requireLocationAccess,
         async (req, res) => {
             try {
                 const body = req.body || {}
-                const locationId = Number(body.locationId)
+                const locationId = Number(body.locationid)
 
                 if (!Number.isInteger(locationId) || locationId <= 0) {
                     return res.status(400).json({
@@ -133,7 +176,17 @@ module.exports = function () {
                 const vipMatchMinPoints = Math.max(0, Number(body.vipMatchMinPoints || 0))
                 const luckyBirdEnabled = parseBoolean(body.luckyBirdEnabled)
                 const luckyBirdMaxCustomersPerDay = Math.max(1, Math.floor(Number(body.luckyBirdMaxCustomersPerDay || 1)))
-                const updatedBy = req.authUser?.id || body.updatedBy || null
+                const updatedBy = req.authUser.id
+
+                if (![cooldownHours, maxMatchesPerDay, vipMatchMinPoints,
+                    luckyBirdMaxCustomersPerDay].every(nonnegativeInteger) ||
+                    luckyBirdMaxCustomersPerDay < 1 ||
+                    !Number.isFinite(ticketPhotoMinAmount) ||
+                    ticketPhotoMinAmount > 9999999999.99 ||
+                    !/^([01]\d|2[0-3]):[0-5]\d$/.test(resetDayTime)) {
+                    return res.status(400).json({ success: false, code: 40000,
+                        message: 'Invalid rule numbers or reset time.' })
+                }
 
                 const result = await pool.query(
                     `

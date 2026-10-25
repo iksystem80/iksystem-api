@@ -3,8 +3,10 @@ const multer = require('multer')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
+const { validateImageUpload } = require('../utils/validateImageUpload')
 const { requireModuleAccess } = require('../utils/moduleAccess')
-const cloudinary = require('../config/cloudinary')
+const { uploadBuffer } = require('../utils/imageStorage')
 
 const luckyBirdUpload = multer({
     storage: multer.memoryStorage(),
@@ -33,13 +35,10 @@ const validId = value =>
 
 const ALLOWED_DENOMINATIONS = new Set([10, 15, 20])
 
-const uploadLuckyBirdImage = buffer => new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-        { folder: 'luckybird-awards', resource_type: 'image' },
-        (error, result) => error ? reject(error) : resolve(result)
-    )
-    stream.end(buffer)
-})
+const uploadLuckyBirdImage = async buffer => {
+  const cloudinaryBuffer = await optimizeImageUpload(buffer)
+  return uploadBuffer(cloudinaryBuffer, { folder: 'luckybird-awards' })
+}
 
 async function activeEmployeeSession(db, req, lock = false) {
     const userId = Number(req.authUser?.id || 0)
@@ -49,11 +48,21 @@ async function activeEmployeeSession(db, req, lock = false) {
     const result = await db.query(`
         SELECT es."ID", es."UserId", es."LocationId", es."ClockIn"
         FROM "EmployeeSession" es
+        JOIN "Locations" l ON l."ID"=es."LocationId"
+        JOIN "Users" u ON u."ID"=es."UserId"
         WHERE es."UserId"=$1
           AND es."ClockOut" IS NULL
+          AND ($2='system admin' OR (l."CompanyId"=$3 AND (
+            $2='owner' OR u."LocationId"=es."LocationId"
+            OR ($2='admin' AND EXISTS (
+              SELECT 1 FROM "UserLocationAccess" ula
+              WHERE ula."UserId"=u."ID" AND ula."LocationId"=es."LocationId"
+            ))
+          )))
         ORDER BY es."ClockIn" DESC
         LIMIT 1 ${lock ? 'FOR UPDATE OF es' : ''}
-    `, [userId])
+    `, [userId, String(req.authUser.roleName || '').trim().toLowerCase(),
+        Number(req.authUser.companyId) || 0])
 
     return result.rows[0] || null
 }
@@ -269,6 +278,7 @@ router.get(
                   ON ms."ID"=m."StatusId"
                 WHERE m.locationid=$1
                   AND m."MachineNumber"::text=$2
+                  AND COALESCE(m."IsArchived",false)=false
                 LIMIT 1
             `, [session.LocationId, machineNumber])
 
@@ -297,6 +307,7 @@ router.post(
     '/give/save',
     requireModuleAccess('luckybird'),
     luckyBirdUpload.single('image'),
+    validateImageUpload,
     async (req, res) => {
         const client = await pool.connect()
 
@@ -347,6 +358,7 @@ router.post(
                 FROM "Machines"
                 WHERE "ID"=$1
                   AND locationid=$2
+                  AND COALESCE("IsArchived",false)=false
                 FOR UPDATE
             `, [machineId, session.LocationId])
 

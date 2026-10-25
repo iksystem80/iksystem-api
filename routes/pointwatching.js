@@ -5,6 +5,60 @@ const router = express.Router()
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
 
+// Point Watching returns customer photos, phone numbers and employee activity.
+// Module permission alone must not authorize a different company's location.
+async function canViewLocation(req, locationid) {
+    if (!Number.isSafeInteger(locationid) || locationid <= 0) return false
+
+    const location = await pool.query(
+        'SELECT "CompanyId" FROM "Locations" WHERE "ID" = $1 LIMIT 1',
+        [locationid]
+    )
+    if (!location.rowCount) return false
+
+    const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+    if (role === 'system admin') return true
+    if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) return false
+    if (role === 'owner') return true
+
+    const userId = Number(req.authUser?.id)
+    if (!Number.isSafeInteger(userId) || userId <= 0) return false
+
+    const access = await pool.query(`
+        SELECT 1
+        FROM "Users" u
+        WHERE u."ID" = $1
+          AND COALESCE(u."IsActive", true) = true
+          AND (
+              u."LocationId" = $2
+              OR ($3 = 'admin' AND EXISTS (
+                  SELECT 1 FROM "UserLocationAccess" ula
+                  WHERE ula."UserId" = u."ID"
+                    AND ula."LocationId" = $2
+              ))
+          )
+        LIMIT 1
+    `, [userId, locationid, role])
+
+    return access.rowCount > 0
+}
+
+async function requirePointLocation(req, res, next) {
+    try {
+        const locationid = Number(req.query.locationid)
+        if (!Number.isSafeInteger(locationid) || locationid <= 0) {
+            return res.status(400).json({ success: false, code: 40000, message: 'Valid locationid is required.' })
+        }
+        if (!(await canViewLocation(req, locationid))) {
+            return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+        }
+        return next()
+    } catch (error) {
+        console.error('Point Watching location authorization:', error)
+        return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify location access.' })
+    }
+}
+
 /*
 ====================================================
 GET EMPLOYEES
@@ -15,6 +69,7 @@ Permission: pointwatching.read
 router.get(
     '/employees',
     requireModuleAccess('operations.pointwatching'),
+    requirePointLocation,
     async (req, res) => {
         try {
             const locationId =
@@ -103,6 +158,7 @@ Permission: pointwatching.read
 router.get(
     '/by-date',
     requireModuleAccess('operations.pointwatching'),
+    requirePointLocation,
     async (req, res) => {
         try {
             const locationId =
@@ -273,6 +329,7 @@ Permission: pointwatching.read
 router.get(
     '/by-employee/:employeeId',
     requireModuleAccess('operations.pointwatching'),
+    requirePointLocation,
     async (req, res) => {
         try {
             const employeeId =
@@ -711,6 +768,16 @@ router.get(
             const session =
                 sessionResult.rows[0]
 
+            // The session ID is supplied by the caller; resolve its real
+            // location before returning any customer or employee details.
+            if (!(await canViewLocation(req, Number(session.locationId)))) {
+                return res.status(403).json({
+                    success: false,
+                    code: 40300,
+                    message: 'Location access denied.'
+                })
+            }
+
             // ======================================================
             // GET POINT ENTRIES BETWEEN CLOCK IN AND CLOCK OUT
             // ======================================================
@@ -750,6 +817,9 @@ router.get(
                         cm."CheckinId"
                             AS "checkinId",
 
+                        u."Name"
+                            AS "employeeName",
+
                         m."MachineNumber"
                             AS "machineNumber",
 
@@ -765,6 +835,13 @@ router.get(
                         ON
                             c."ID" =
                                 cm."CustomerId"
+
+                    LEFT JOIN
+                        "Users" u
+
+                        ON
+                            u."ID" =
+                                cm."AssignedBy"
 
                     LEFT JOIN
                         "Machines" m

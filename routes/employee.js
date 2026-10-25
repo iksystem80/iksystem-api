@@ -33,6 +33,31 @@ function isAdmin(req) {
     return normalizeRoleName(req.authUser?.roleName) === 'admin'
 }
 
+// User-management module access alone must not grant account-administration powers.
+function requireAccountManager(req, res, next) {
+    if (isSystemAdmin(req) || isOwner(req) || isAdmin(req)) return next()
+    return res.status(403).json({
+        success: false, code: 40300,
+        message: 'Owner/Admin access is required to manage user accounts.'
+    })
+}
+
+function mayManageRole(req, roleName) {
+    const target = normalizeRoleName(roleName)
+    if (isSystemAdmin(req)) return true
+    if (target === 'system admin') return false
+    if (isOwner(req)) return true
+    // Admins may manage non-privileged roles, but not peer admins or owners.
+    return isAdmin(req) && !['owner', 'admin'].includes(target)
+}
+
+function denyHigherRole(res) {
+    return res.status(403).json({
+        success: false, code: 40300,
+        message: 'You cannot manage or assign this account role.'
+    })
+}
+
 function normalizeLocationIds(values = []) {
     return [...new Set(
         (Array.isArray(values) ? values : [])
@@ -332,6 +357,13 @@ async function verifyRoleAssignment(
         }
     }
 
+    if (!mayManageRole(req, targetRole)) {
+        return {
+            success: false, status: 403, code: 40300,
+            message: 'You cannot assign this account role.'
+        }
+    }
+
     return {
         success: true,
         role
@@ -594,6 +626,7 @@ router.get(
 router.post(
     '/saveemployee',
     requireModuleAccess('settings.users'),
+    requireAccountManager,
     async (req, res) => {
         try {
             const {
@@ -852,6 +885,7 @@ router.post(
 router.put(
     '/update/:id',
     requireModuleAccess('settings.users'),
+    requireAccountManager,
     async (req, res) => {
         const client =
             await pool.connect()
@@ -875,6 +909,21 @@ router.put(
                 Number(
                     req.params.id
                 )
+
+            if (typeof isActive !== 'boolean') {
+                return res.status(400).json({
+                    success: false, code: 40000,
+                    message: 'User active status must be true or false.'
+                })
+            }
+
+            if (password !== undefined && password !== null &&
+                (typeof password !== 'string' || password.length > 1024)) {
+                return res.status(400).json({
+                    success: false, code: 40000,
+                    message: 'Invalid password value.'
+                })
+            }
 
             if (
                 !username?.trim() ||
@@ -911,6 +960,10 @@ router.put(
                         message:
                             userAccess.message
                     })
+            }
+
+            if (!mayManageRole(req, userAccess.user.roleName)) {
+                return denyHigherRole(res)
             }
 
             // ========================================================
@@ -1076,6 +1129,8 @@ router.put(
             "Phone" = $8,
             "JobTitle" = $9,
             "IsActive" = $10,
+            "token" = NULL,
+            "TokenExpiresAt" = NULL,
             "DateUpdated" = NOW()
 
           WHERE
@@ -1115,6 +1170,8 @@ router.put(
             "Phone" = $7,
             "JobTitle" = $8,
             "IsActive" = $9,
+            "token" = CASE WHEN $9 = false THEN NULL ELSE "token" END,
+            "TokenExpiresAt" = CASE WHEN $9 = false THEN NULL ELSE "TokenExpiresAt" END,
             "DateUpdated" = NOW()
 
           WHERE
@@ -1201,12 +1258,20 @@ router.put(
 router.patch(
     '/status/:id',
     requireModuleAccess('settings.users'),
+    requireAccountManager,
     async (req, res) => {
         try {
             const userId =
                 Number(
                     req.params.id
                 )
+
+            if (typeof req.body?.isActive !== 'boolean') {
+                return res.status(400).json({
+                    success: false, code: 40000,
+                    message: 'User active status must be true or false.'
+                })
+            }
 
             if (
                 userId ===
@@ -1244,6 +1309,10 @@ router.patch(
                     })
             }
 
+            if (!mayManageRole(req, userAccess.user.roleName)) {
+                return denyHigherRole(res)
+            }
+
             if (
                 normalizeRoleName(
                     userAccess.user.roleName
@@ -1266,6 +1335,8 @@ router.patch(
 
           SET
             "IsActive" = $1,
+            "token" = CASE WHEN $1 = false THEN NULL ELSE "token" END,
+            "TokenExpiresAt" = CASE WHEN $1 = false THEN NULL ELSE "TokenExpiresAt" END,
             "DateUpdated" = NOW()
 
           WHERE
@@ -1324,6 +1395,7 @@ router.patch(
 router.delete(
     '/delete',
     requireModuleAccess('settings.users'),
+    requireAccountManager,
     async (req, res) => {
         try {
             const {
@@ -1368,6 +1440,10 @@ router.delete(
                         message:
                             userAccess.message
                     })
+            }
+
+            if (!mayManageRole(req, userAccess.user.roleName)) {
+                return denyHigherRole(res)
             }
 
             if (

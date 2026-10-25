@@ -1,4 +1,5 @@
 const express = require('express')
+const twilio = require('twilio')
 const router = express.Router()
 
 const { pool } = require('../db')
@@ -13,13 +14,87 @@ function companyId(req) {
   return Number(req.authUser?.companyId || 0)
 }
 
+// Use the currently selected location for both module authorization and data.
+// The module-access middleware validates that the user is allowed at this location.
+// Do not trust a location from the client without that permission check.
+function selectedPromotionLocation(req, res, next) {
+  const raw = req.body?.locationid ?? req.query?.locationid
+  const id = Number(raw)
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return res.status(400).json({ success: false, code: 40000, message: 'Valid location is required.' })
+  }
+  // requireModuleAccess reads query.locationid (and body.locationid, if supplied).
+  req.query.locationid = String(id)
+  req.promotionLocationId = id
+  next()
+}
+
 function locationId(req) {
-  return Number(req.authUser?.locationId || 0)
+  return req.promotionLocationId
+}
+
+async function requirePromotionLocationAccess(req, res, next) {
+  try {
+    const lid = locationId(req)
+    const location = await pool.query(`SELECT "CompanyId" FROM "Locations" WHERE "ID"=$1 LIMIT 1`, [lid])
+    if (!location.rowCount) {
+      return res.status(404).json({ success: false, code: 40400, message: 'Location not found.' })
+    }
+    const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+    if (role !== 'system admin') {
+      if (Number(location.rows[0].CompanyId) !== companyId(req)) {
+        return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+      }
+      if (role !== 'owner') {
+        const access = await pool.query(`
+          SELECT 1 FROM "Users" u WHERE u."ID"=$1
+            AND COALESCE(u."IsActive",true)=true
+            AND (u."LocationId"=$2 OR ($3='admin' AND EXISTS (
+              SELECT 1 FROM "UserLocationAccess" ula
+              WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+            ))) LIMIT 1
+        `, [userId(req), lid, role])
+        if (!access.rowCount) {
+          return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+        }
+      }
+    }
+    return next()
+  } catch (error) {
+    console.error('Promotion location authorization:', error)
+    return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify location access.' })
+  }
+}
+
+async function requirePromotionTemplateAccess(req, res, next) {
+  const raw = req.body?.templateid
+  if (raw === undefined || raw === null || raw === '') return next()
+  const templateId = Number(raw)
+  if (!Number.isSafeInteger(templateId) || templateId <= 0) {
+    return res.status(400).json({ success: false, code: 40000, message: 'Invalid promotion template.' })
+  }
+  try {
+    const template = await pool.query(`
+      SELECT 1 FROM "PromotionTemplates"
+      WHERE "ID"=$1 AND COALESCE("IsDeleted",false)=false
+        AND ("IsSystemTemplate"=true OR "CompanyId"=$2)
+      LIMIT 1
+    `, [templateId, companyId(req)])
+    if (!template.rowCount) {
+      return res.status(403).json({ success: false, code: 40300, message: 'Promotion template access denied.' })
+    }
+    return next()
+  } catch (error) {
+    console.error('Promotion template authorization:', error)
+    return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify template access.' })
+  }
 }
 
 router.get(
   '/list',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -38,6 +113,7 @@ router.get(
         ON pr."PromotionId" = p."ID"
       WHERE
         p."CompanyId" = $1
+        AND p."LocationId" = $2
         AND COALESCE(p."IsDeleted", false) = false
       GROUP BY
         p."ID",
@@ -48,7 +124,7 @@ router.get(
       ORDER BY
         p."CreatedAt" DESC
       `,
-      [cid]
+      [cid, locationId(req)]
     )
 
     return res.json({
@@ -70,7 +146,9 @@ router.get(
 
 router.get(
   '/detail',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -94,10 +172,11 @@ router.get(
       WHERE
         "ID" = $1
         AND "CompanyId" = $2
+        AND "LocationId" = $3
         AND COALESCE("IsDeleted", false) = false
       LIMIT 1
       `,
-      [id, cid]
+      [id, cid, locationId(req)]
     )
 
     if (!result.rows.length) {
@@ -127,7 +206,10 @@ router.get(
 
 router.post(
   '/create',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
+  requirePromotionTemplateAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -208,7 +290,10 @@ router.post(
 
 router.put(
   '/update',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
+  requirePromotionTemplateAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -237,6 +322,7 @@ router.put(
       WHERE
         "ID" = $1
         AND "CompanyId" = $2
+        AND "LocationId" = $9
         AND "Status" = 'Draft'
       RETURNING "ID" AS id
       `,
@@ -248,7 +334,8 @@ router.put(
         messagetext || null,
         channel || null,
         finalimageurl || null,
-        uid
+        uid,
+        locationId(req)
       ]
     )
 
@@ -279,7 +366,9 @@ router.put(
 
 router.post(
   '/recipients',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
     const client =
       await pool.connect()
@@ -329,13 +418,15 @@ router.post(
             WHERE
               "ID" = $1
               AND "CompanyId" = $2
+              AND "LocationId" = $3
               AND "Status" = 'Draft'
 
             FOR UPDATE
           `,
           [
             promotionId,
-            cid
+            cid,
+            locationId(req)
           ]
         )
 
@@ -501,7 +592,9 @@ router.post(
 
 router.get(
   '/recipients',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -528,9 +621,10 @@ router.get(
       WHERE
         pr."PromotionId" = $1
         AND p."CompanyId" = $2
+        AND p."LocationId" = $3
       ORDER BY pr."ID" ASC
       `,
-      [id, cid]
+      [id, cid, locationId(req)]
     )
 
     return res.json({
@@ -552,7 +646,9 @@ router.get(
 
 router.post(
   '/send',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -568,8 +664,9 @@ router.post(
       WHERE
         pr."PromotionId" = $1
         AND p."CompanyId" = $2
+        AND p."LocationId" = $3
       `,
-      [id, cid]
+      [id, cid, locationId(req)]
     )
 
     if (recipientCountResult.rows[0].count === 0) {
@@ -590,10 +687,11 @@ router.post(
       WHERE
         "ID" = $1
         AND "CompanyId" = $2
+        AND "LocationId" = $4
         AND "Status" = 'Draft'
       RETURNING *
       `,
-      [id, cid, uid]
+      [id, cid, uid, locationId(req)]
     )
 
     if (!result.rows.length) {
@@ -648,7 +746,31 @@ router.post(
   }
 )
 
-router.post('/twilio/status', async (req, res) => {
+// Twilio status callbacks are public, so authenticate the webhook itself.
+// Use the exact public HTTPS callback URL configured with Twilio; deriving it
+// from request headers is unreliable behind a reverse proxy.
+function verifyTwilioStatusCallback(req, res, next) {
+  const authToken = process.env.TWILIO_AUTH_TOKEN
+  const callbackUrl = process.env.TWILIO_PROMOTION_CALLBACK_URL
+  if (!authToken || !callbackUrl) {
+    console.error('Twilio status callback credentials/URL are not configured.')
+    return res.sendStatus(503)
+  }
+  if (!req.is('application/x-www-form-urlencoded') ||
+      !req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return res.sendStatus(400)
+  }
+  if (JSON.stringify(req.body).length > 16 * 1024) {
+    return res.sendStatus(413)
+  }
+  const signature = req.get('X-Twilio-Signature') || ''
+  if (!signature || !twilio.validateRequest(authToken, signature, callbackUrl, req.body)) {
+    return res.sendStatus(403)
+  }
+  next()
+}
+
+router.post('/twilio/status', verifyTwilioStatusCallback, async (req, res) => {
   try {
     const sid =
       req.body.MessageSid ||
@@ -761,7 +883,9 @@ router.post('/twilio/status', async (req, res) => {
 
 router.get(
   '/logs',
+  selectedPromotionLocation,
   requireModuleAccess('promotions.list'),
+  requirePromotionLocationAccess,
   async (req, res) => {
   try {
     const cid = companyId(req)
@@ -780,10 +904,11 @@ router.get(
       WHERE
         a."PromotionId" = $1
         AND p."CompanyId" = $2
+        AND p."LocationId" = $3
       ORDER BY
         a."CreatedAt" DESC
       `,
-      [id, cid]
+      [id, cid, locationId(req)]
     )
 
     const deliveryResult = await pool.query(
@@ -802,10 +927,11 @@ router.get(
       WHERE
         l."PromotionId" = $1
         AND p."CompanyId" = $2
+        AND p."LocationId" = $3
       ORDER BY
         l."CreatedAt" DESC
       `,
-      [id, cid]
+      [id, cid, locationId(req)]
     )
 
     return res.json({

@@ -1,10 +1,64 @@
 const express = require('express')
 const multer = require('multer')
+const crypto = require('crypto')
 const router = express.Router()
 
 const { pool } = require('../db')
+const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
+const { validateImageUpload } = require('../utils/validateImageUpload')
 const { requireModuleAccess } = require('../utils/moduleAccess')
-const cloudinary = require('../config/cloudinary')
+const { uploadBuffer } = require('../utils/imageStorage')
+
+async function requireBonusLocationAccess(req, res, next) {
+    try {
+        let locationId
+        if (req.params.id !== undefined) {
+            const bonusId = Number(req.params.id)
+            if (!Number.isSafeInteger(bonusId) || bonusId <= 0) {
+                return res.status(400).json({ success: false, code: 40000, message: 'Invalid bonus.' })
+            }
+            const bonus = await pool.query(`SELECT "LocationId" FROM "Bonus" WHERE "ID"=$1 LIMIT 1`, [bonusId])
+            if (!bonus.rowCount) {
+                return res.status(404).json({ success: false, code: 40400, message: 'Bonus not found.' })
+            }
+            locationId = Number(bonus.rows[0].LocationId)
+        } else {
+            locationId = Number(req.body?.locationId ?? req.query.locationid)
+        }
+
+        if (!Number.isSafeInteger(locationId) || locationId <= 0) {
+            return res.status(400).json({ success: false, code: 40000, message: 'Valid location is required.' })
+        }
+
+        const location = await pool.query(`SELECT "CompanyId" FROM "Locations" WHERE "ID"=$1 LIMIT 1`, [locationId])
+        if (!location.rowCount) {
+            return res.status(404).json({ success: false, code: 40400, message: 'Location not found.' })
+        }
+
+        const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+        if (role !== 'system admin') {
+            if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+            }
+            if (role !== 'owner') {
+                const access = await pool.query(`
+                    SELECT 1 FROM "Users" u WHERE u."ID"=$1
+                      AND (u."LocationId"=$2 OR ($3='admin' AND EXISTS (
+                        SELECT 1 FROM "UserLocationAccess" ula
+                        WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+                      ))) LIMIT 1
+                `, [req.authUser.id, locationId, role])
+                if (!access.rowCount) {
+                    return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+                }
+            }
+        }
+        return next()
+    } catch (error) {
+        console.error('Bonus location authorization:', error)
+        return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify bonus location.' })
+    }
+}
 
 const bonusGiveUpload = multer({
     storage: multer.memoryStorage(),
@@ -31,13 +85,10 @@ const bonusGiveFail = (res, http, message) => res.status(http).json({
 const bonusGiveValidId = value =>
     Number.isSafeInteger(Number(value)) && Number(value) > 0
 
-const uploadBonusImage = buffer => new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-        { folder: 'bonus-awards', resource_type: 'image' },
-        (error, result) => error ? reject(error) : resolve(result)
-    )
-    stream.end(buffer)
-})
+const uploadBonusImage = async buffer => {
+  const cloudinaryBuffer = await optimizeImageUpload(buffer)
+  return uploadBuffer(cloudinaryBuffer, { folder: 'bonus-awards' })
+}
 
 async function activeBonusGiveSession(db, req, lock = false) {
     const userId = Number(req.authUser?.id || 0)
@@ -47,11 +98,21 @@ async function activeBonusGiveSession(db, req, lock = false) {
     const result = await db.query(`
         SELECT es."ID", es."UserId", es."LocationId", es."ClockIn"
         FROM "EmployeeSession" es
+        JOIN "Locations" l ON l."ID"=es."LocationId"
+        JOIN "Users" u ON u."ID"=es."UserId"
         WHERE es."UserId"=$1
           AND es."ClockOut" IS NULL
+          AND ($2='system admin' OR (l."CompanyId"=$3 AND (
+            $2='owner' OR u."LocationId"=es."LocationId"
+            OR ($2='admin' AND EXISTS (
+              SELECT 1 FROM "UserLocationAccess" ula
+              WHERE ula."UserId"=u."ID" AND ula."LocationId"=es."LocationId"
+            ))
+          )))
         ORDER BY es."ClockIn" DESC
         LIMIT 1 ${lock ? 'FOR UPDATE OF es' : ''}
-    `, [userId])
+    `, [userId, String(req.authUser.roleName || '').trim().toLowerCase(),
+        Number(req.authUser.companyId) || 0])
 
     return result.rows[0] || null
 }
@@ -433,6 +494,7 @@ async function insertScheduleBlocks(
 router.get(
     '/active/current/list',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         try {
             const locationId =
@@ -649,6 +711,7 @@ router.get(
                   ON ms."ID"=m."StatusId"
                 WHERE m.locationid=$1
                   AND m."MachineNumber"::text=$2
+                  AND COALESCE(m."IsArchived",false)=false
                 LIMIT 1
             `, [session.LocationId, machineNumber])
 
@@ -734,6 +797,7 @@ router.post(
     '/give/save',
     requireModuleAccess('bonus'),
     bonusGiveUpload.single('image'),
+    validateImageUpload,
     async (req, res) => {
         const client = await pool.connect()
 
@@ -772,11 +836,51 @@ router.post(
                 return bonusGiveFail(res, 409, 'Clock in before giving a Bonus.')
             }
 
+            // Optional replay protection, shared with the cash movement routes.
+            // The employee session row is locked above, serializing retries for
+            // this user before any image upload or monetary change occurs.
+            const rawKey = req.get('Idempotency-Key')
+            const requestKey = typeof rawKey === 'string' ? rawKey.trim() : ''
+            if (rawKey !== undefined && (!requestKey || requestKey.length > 128)) {
+                await client.query('ROLLBACK')
+                return bonusGiveFail(res, 400, 'Invalid Idempotency-Key header.')
+            }
+
+            const routeKey = 'bonus.give.save'
+            const payloadHash = requestKey ? crypto.createHash('sha256')
+                .update(JSON.stringify({
+                    bonusid: bonusId,
+                    payoutid: payoutId,
+                    machineid: machineId,
+                    customerid: customerId,
+                    imageHash: crypto.createHash('sha256').update(req.file.buffer).digest('hex')
+                }))
+                .digest('hex') : null
+
+            if (requestKey) {
+                const previous = await client.query(`
+                    SELECT "PayloadHash", "Response"
+                    FROM "CashMovementIdempotency"
+                    WHERE "UserId"=$1 AND "LocationId"=$2
+                      AND "Route"=$3 AND "RequestKey"=$4
+                    LIMIT 1
+                `, [session.UserId, session.LocationId, routeKey, requestKey])
+
+                if (previous.rowCount) {
+                    await client.query('ROLLBACK')
+                    if (previous.rows[0].PayloadHash !== payloadHash) {
+                        return bonusGiveFail(res, 409, 'Idempotency-Key already used for a different request.')
+                    }
+                    return res.json(previous.rows[0].Response)
+                }
+            }
+
             const machine = await client.query(`
                 SELECT "ID", "MachineNumber"
                 FROM "Machines"
                 WHERE "ID"=$1
                   AND locationid=$2
+                  AND COALESCE("IsArchived",false)=false
                 FOR UPDATE
             `, [machineId, session.LocationId])
 
@@ -896,14 +1000,14 @@ router.post(
                 session.UserId
             ])
 
-            await client.query('COMMIT')
-
             const customerName =
                 `${customer.rows[0].Firstname || ''} ${customer.rows[0].Lastname || ''}`.trim()
 
-            return bonusGiveOk(
-                res,
-                {
+            const response = {
+                success: true,
+                code: 20000,
+                message: 'Bonus saved and deducted from your employee session.',
+                data: {
                     id: award.rows[0].id,
                     createdAt: award.rows[0].createdAt,
                     bonusId: payout.rows[0].bonusId,
@@ -916,9 +1020,20 @@ router.post(
                     customerName,
                     amount,
                     imageUrl: image.secure_url
-                },
-                'Bonus saved and deducted from your employee session.'
-            )
+                }
+            }
+
+            if (requestKey) {
+                await client.query(`
+                    INSERT INTO "CashMovementIdempotency"
+                        ("UserId", "LocationId", "Route", "RequestKey", "PayloadHash", "Response")
+                    VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+                `, [session.UserId, session.LocationId, routeKey, requestKey,
+                    payloadHash, JSON.stringify(response)])
+            }
+
+            await client.query('COMMIT')
+            return res.json(response)
         } catch (error) {
             try {
                 await client.query('ROLLBACK')
@@ -941,6 +1056,7 @@ router.post(
 router.get(
     '/',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         try {
             const locationId =
@@ -1040,6 +1156,7 @@ router.get(
 router.get(
     '/:id',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         try {
             const bonusId =
@@ -1230,6 +1347,7 @@ router.get(
 router.post(
     '/',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         const client =
             await pool.connect()
@@ -1349,6 +1467,7 @@ router.post(
 router.put(
     '/:id',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         const client =
             await pool.connect()
@@ -1513,6 +1632,7 @@ router.put(
 router.patch(
     '/:id/status',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         try {
             const bonusId =
@@ -1608,6 +1728,7 @@ router.patch(
 router.delete(
     '/:id',
     requireModuleAccess('settings.bonus'),
+    requireBonusLocationAccess,
     async (req, res) => {
         try {
             const bonusId =

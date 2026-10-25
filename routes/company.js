@@ -229,17 +229,21 @@ router.post(
             } = req.body
 
             if (
-                !companyName ||
-                !locationName ||
-                !ownerName ||
-                !ownerUsername ||
-                !ownerPassword
+                ![locationName, ownerName, ownerUsername].every(
+                    value => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 100
+                ) ||
+                typeof companyName !== 'string' || !companyName.trim() || companyName.trim().length > 200 ||
+                typeof ownerPassword !== 'string' ||
+                ownerPassword.length === 0 || ownerPassword.length > 128 ||
+                (companyCode != null && (typeof companyCode !== 'string' || companyCode.length > 50)) ||
+                (ownerEmail != null && typeof ownerEmail !== 'string') ||
+                (ownerPhone != null && typeof ownerPhone !== 'string')
             ) {
                 return res.status(400).json({
                     success: false,
                     code: 40000,
                     message:
-                        'Company, location and owner information are required.'
+                        'Valid company, location and owner information are required.'
                 })
             }
 
@@ -524,7 +528,6 @@ router.post(
                 success: false,
                 code: 50000,
                 message:
-                    error.message ||
                     'Unable to create company.'
             })
 
@@ -557,11 +560,25 @@ router.put(
                 status
             } = req.body
 
-            let nextIsActive =
-                isActive !== false
+            if (!Number.isSafeInteger(companyId) || companyId <= 0 ||
+                typeof name !== 'string' || !name.trim() || name.trim().length > 200 ||
+                (code != null && (typeof code !== 'string' || code.length > 50)) ||
+                (isActive !== undefined && typeof isActive !== 'boolean') ||
+                (isSuspended !== undefined && typeof isSuspended !== 'boolean')) {
+                return res.status(400).json({ success: false, code: 40000, message: 'Invalid company details.' })
+            }
 
-            let nextIsSuspended =
-                Boolean(isSuspended)
+            const currentResult = await pool.query(
+                'SELECT "IsActive", "IsSuspended" FROM "Companies" WHERE "ID"=$1 LIMIT 1',
+                [companyId]
+            )
+            if (!currentResult.rowCount) {
+                return res.status(404).json({ success: false, code: 40400, message: 'Company not found.' })
+            }
+
+            // Editing the company name/code must not silently reactivate it.
+            let nextIsActive = isActive === undefined ? currentResult.rows[0].IsActive : isActive
+            let nextIsSuspended = isSuspended === undefined ? currentResult.rows[0].IsSuspended : isSuspended
 
             if (status) {
                 const normalizedStatus =
@@ -620,8 +637,8 @@ router.put(
                         "IsSuspended" AS "isSuspended"
                     `,
                     [
-                        name,
-                        code || null,
+                        name.trim(),
+                        code?.trim() || null,
                         nextIsActive,
                         nextIsSuspended,
                         companyId
@@ -707,10 +724,18 @@ router.patch(
                     req.params.id
                 )
 
+            if (!Number.isSafeInteger(companyId) || companyId <= 0) {
+                return res.status(400).json({ success: false, code: 40000, message: 'Valid company is required.' })
+            }
+
             const {
                 isActive,
                 status
             } = req.body
+
+            if (!status && typeof isActive !== 'boolean') {
+                return res.status(400).json({ success: false, code: 40000, message: 'Valid status is required.' })
+            }
 
             let nextIsActive
             let nextIsSuspended

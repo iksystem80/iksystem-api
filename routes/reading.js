@@ -3,6 +3,7 @@ const router = express.Router()
 
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
+const { authenticate } = require('../middleware/auth')
 
 // ============================================================
 // HELPERS
@@ -30,6 +31,58 @@ function errorResponse(
     })
 }
 
+// Every Reading Sessions endpoint is location-scoped. Validate location
+// membership independently of the module permission for the selected UI
+// location: callers must not change locationid to read or modify another site.
+router.use(authenticate, async (req, res, next) => {
+    const suppliedLocation = req.method === 'GET'
+        ? req.query.locationid
+        : (req.body?.locationid ?? req.query.locationid)
+    const locationId = Number(suppliedLocation)
+
+    if (!Number.isSafeInteger(locationId) || locationId <= 0) {
+        return errorResponse(res, 400, 'Valid locationid is required.', 40000)
+    }
+
+    try {
+        const location = await pool.query(`
+            SELECT "CompanyId" FROM "Locations" WHERE "ID" = $1 LIMIT 1
+        `, [locationId])
+        if (!location.rowCount) {
+            return errorResponse(res, 404, 'Location not found.', 40400)
+        }
+
+        const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+        if (role !== 'system admin') {
+            if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                return errorResponse(res, 403, 'Location access denied.', 40300)
+            }
+
+            if (role !== 'owner') {
+                const access = await pool.query(`
+                    SELECT 1 FROM "Users" u
+                    WHERE u."ID" = $1
+                      AND (u."LocationId" = $2
+                        OR ($3 = 'admin' AND EXISTS (
+                            SELECT 1 FROM "UserLocationAccess" ula
+                            WHERE ula."UserId" = u."ID"
+                              AND ula."LocationId" = $2
+                        )))
+                    LIMIT 1
+                `, [req.authUser.id, locationId, role])
+                if (!access.rowCount) {
+                    return errorResponse(res, 403, 'Location access denied.', 40300)
+                }
+            }
+        }
+
+        return next()
+    } catch (error) {
+        console.error('Reading location authorization:', error)
+        return errorResponse(res, 500, 'Unable to verify location access.')
+    }
+})
+
 // ============================================================
 // EMPLOYEE SESSION COVERAGE
 // ============================================================
@@ -50,7 +103,7 @@ router.get('/employee-sessions', requireModuleAccess(["reading.record", "reading
         if (!session.rowCount) return errorResponse(res, 404, 'Open reading session was not found at this location.', 40400)
 
         const result = await pool.query(`
-            SELECT es."ID" AS id, es."UserId" AS "userId",
+            SELECT es."ID" AS id, es."SessionNumber" AS "sessionNumber", es."UserId" AS "userId",
                    COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                    es."ClockIn" AS "clockIn", es."ClockOut" AS "clockOut",
                    es."ReadingSessionId" AS "readingSessionId"
@@ -129,6 +182,7 @@ router.post(
     '/startnewsession',
     requireModuleAccess(["reading.record", "reading.reports"]),
     async (req, res) => {
+        const client = await pool.connect()
         try {
             const {
                 locationid
@@ -143,7 +197,14 @@ router.post(
                 )
             }
 
-            const result = await pool.query(
+            await client.query('BEGIN')
+            await client.query('SELECT pg_advisory_xact_lock(917202,$1::integer)', [Number(locationid)])
+            const nextNumber = await client.query(`
+                SELECT COALESCE(MAX("SessionNumber"),0)+1 AS next_number
+                FROM "ReadingSessions" WHERE "LocationId"=$1`, [Number(locationid)])
+            const sessionNumber = nextNumber.rows[0].next_number
+
+            const result = await client.query(
                 `
                 INSERT INTO "ReadingSessions"
                 (
@@ -151,6 +212,7 @@ router.post(
                     "StartedAt",
                     "Status",
                     "LocationId",
+                    "SessionNumber",
                     "isDeleted"
                 )
                 VALUES
@@ -159,10 +221,12 @@ router.post(
                     NOW(),
                     1,
                     $1,
+                    $2,
                     false
                 )
                 RETURNING
                     "ID" AS id,
+                    "SessionNumber" AS "sessionNumber",
                     "DateCreated" AS datecreated,
                     "StartedAt" AS startedat,
                     "EndedAt" AS endedat,
@@ -170,9 +234,11 @@ router.post(
                     "LocationId" AS locationid
                 `,
                 [
-                    locationid
+                    locationid,
+                    sessionNumber
                 ]
             )
+            await client.query('COMMIT')
 
             const session =
                 result.rows[0]
@@ -186,6 +252,7 @@ router.post(
             })
 
         } catch (error) {
+            try { await client.query('ROLLBACK') } catch (_) { }
             console.error(
                 'Start reading session error:',
                 error
@@ -196,6 +263,8 @@ router.post(
                 500,
                 'Error while creating new session.'
             )
+        } finally {
+            client.release()
         }
     }
 )
@@ -227,6 +296,7 @@ router.get(
                 `
                 SELECT
                     rs."ID" AS ID,
+                    rs."SessionNumber" AS "sessionNumber",
 
                     rs."DateCreated" AS datecreated,
                     rs."StartedAt" AS startedat,
@@ -1083,6 +1153,7 @@ router.put(
                     WHERE "ID" = $1
                     RETURNING
                         "ID" AS id,
+                        "SessionNumber" AS "sessionNumber",
                         "StartedAt" AS startedat,
                         "EndedAt" AS endedat,
                         "Status" AS status
@@ -1107,6 +1178,7 @@ router.put(
                 WHERE "ID" = $1
                 RETURNING
                     "ID" AS id,
+                    "SessionNumber" AS "sessionNumber",
                     "StartedAt" AS startedat,
                     "EndedAt" AS endedat,
                     "Status" AS status
@@ -1407,6 +1479,7 @@ router.get(
                 `
                 SELECT
                     rs."ID" AS id,
+                    rs."SessionNumber" AS "sessionNumber",
                     rs."DateCreated" AS datecreated,
                     rs."StartedAt" AS startedat,
                     rs."EndedAt" AS endedat,
@@ -1501,6 +1574,7 @@ router.get(
                     `
                     SELECT
                         "ID" AS id,
+                        "SessionNumber" AS "sessionNumber",
                         "StartedAt" AS startedat,
                         "EndedAt" AS endedat,
                         "Status" AS status,
@@ -1741,7 +1815,7 @@ router.get(
             // LATERAL aggregation avoids duplicating employee session rows.
             const coveredEmployees = await pool.query(`
                 SELECT
-                    es."ID" AS id,
+                    es."ID" AS id, es."SessionNumber" AS "sessionNumber",
                     es."UserId" AS "userId",
                     COALESCE(NULLIF(BTRIM(u."Name"), ''), u."Username", 'Employee') AS "employeeName",
                     es."ClockIn" AS "clockIn",
@@ -1749,6 +1823,9 @@ router.get(
                     COALESCE(points."totalPoints", 0)::numeric(14,2) AS "sessionPoints",
                     COALESCE(points."assignmentCount", 0)::integer AS "assignmentCount",
                     COALESCE(covered_points."coveredPoints", 0)::numeric(14,2) AS "coveredPoints",
+                    COALESCE(extra_match."extraMatchPoints", 0)::numeric(14,2) AS "extraMatchPoints",
+                    COALESCE(ticket_outs."totalTicketOut", 0)::numeric(14,2) AS "totalTicketOut",
+                    COALESCE(closing."shortOver", 0)::numeric(14,2) AS "shortOver",
                     COALESCE(pulls."totalPull", 0)::numeric(14,2) AS "totalPull"
                 FROM "EmployeeSession" es
                 JOIN "Users" u ON u."ID" = es."UserId"
@@ -1770,6 +1847,7 @@ router.get(
                       AND cm."LocationId" = es."LocationId"
                       AND cm."DateAssign" >= (es."ClockIn" AT TIME ZONE 'America/Chicago')
                       AND cm."DateAssign" <= (es."ClockOut" AT TIME ZONE 'America/Chicago')
+                      AND COALESCE(cm."IsExtraMatch", false) = false
                       AND EXISTS (
                           SELECT 1
                           FROM "MachineReadings" mr
@@ -1779,11 +1857,36 @@ router.get(
                 ) covered_points ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT
+                        COALESCE(SUM(cm."Points"), 0) AS "extraMatchPoints"
+                    FROM "CustomerMatch" cm
+                    WHERE cm."AssignedBy" = es."UserId"
+                      AND cm."LocationId" = es."LocationId"
+                      AND cm."DateAssign" >= (es."ClockIn" AT TIME ZONE 'America/Chicago')
+                      AND cm."DateAssign" <= (es."ClockOut" AT TIME ZONE 'America/Chicago')
+                      AND COALESCE(cm."IsExtraMatch", false) = true
+                ) extra_match ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COALESCE(SUM(tk."Amount"), 0) AS "totalTicketOut"
+                    FROM "TicketOuts" tk
+                    WHERE tk."EmployeeSessionId" = es."ID"
+                      AND tk."LocationId" = es."LocationId"
+                ) ticket_outs ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COALESCE(sc."Variance", 0) AS "shortOver"
+                    FROM "SessionCashClosings" sc
+                    WHERE sc."SessionId" = es."ID"
+                      AND sc."LocationId" = es."LocationId"
+                    LIMIT 1
+                ) closing ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT
                         COALESCE(SUM(t."Amount"), 0) AS "totalPull"
                     FROM "SessionCashTransactions" t
                     JOIN "CreditTypes" ct
                       ON ct."ID" = t."CreditTypeId"
-                     AND ct."LocationId" = t."LocationId"
+                     AND (ct."LocationId" IS NULL OR ct."LocationId" = t."LocationId")
                     WHERE t."SessionId" = es."ID"
                       AND t."LocationId" = es."LocationId"
                       AND t."Type" = 'CASH_RECEIVED'
@@ -1808,7 +1911,7 @@ router.get(
                  AND t."LocationId" = es."LocationId"
                 JOIN "CreditTypes" ct
                   ON ct."ID" = t."CreditTypeId"
-                 AND ct."LocationId" = t."LocationId"
+                 AND (ct."LocationId" IS NULL OR ct."LocationId" = t."LocationId")
                 WHERE es."ReadingSessionId" = $1
                   AND es."LocationId" = $2
                   AND es."ClockOut" IS NOT NULL
@@ -1914,6 +2017,7 @@ router.get(
                 LEFT JOIN LATERAL (
                     SELECT
                         rs."ID" AS id,
+                    rs."SessionNumber" AS "sessionNumber",
                         rs."StartedAt" AS startedat,
                         rs."EndedAt" AS endedat,
                         rs."Status" AS status,
@@ -1961,6 +2065,7 @@ router.get(
             const sessionResult = await pool.query(`
                 SELECT
                     rs."ID" AS id,
+                    rs."SessionNumber" AS "sessionNumber",
                     rs."StartedAt" AS "startedAt",
                     rs."EndedAt" AS "endedAt",
                     rs."Status" AS status,
@@ -2121,7 +2226,7 @@ router.get(
 
             const employeeResult = await pool.query(`
                 SELECT
-                    es."ID" AS id,
+                    es."ID" AS id, es."SessionNumber" AS "sessionNumber",
                     es."UserId" AS "userId",
                     COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS name,
                     es."ClockIn" AS "clockIn",
@@ -2309,7 +2414,7 @@ router.get(
                         INNER JOIN covered c ON c."ID"=t."SessionId"
                         LEFT JOIN "CreditTypes" ct
                           ON ct."ID"=t."CreditTypeId"
-                         AND ct."LocationId"=t."LocationId"
+                         AND (ct."LocationId" IS NULL OR ct."LocationId"=t."LocationId")
                         WHERE t."LocationId"=$2
                           AND t."Type"='CASH_RECEIVED'
                           AND UPPER(COALESCE(ct."Code",'')) IN ('SHORT_PAYMENT','EMPLOYEE_SHORT_PAYMENT')
@@ -2337,6 +2442,16 @@ router.get(
                         WHERE rp."LocationId"=$2
                           AND rp."ReadingSessionId"=$1
                     ),0)::numeric(14,2) AS "machineCollectionAmount",
+
+                    -- Historical postings can have NULL CalculatedAmount. Preserve
+                    -- that distinction rather than assuming actual = calculated.
+                    (
+                        SELECT rp."CalculatedAmount"
+                        FROM "ReadingProfitPostings" rp
+                        WHERE rp."LocationId"=$2
+                          AND rp."ReadingSessionId"=$1
+                        LIMIT 1
+                    )::numeric(14,2) AS "calculatedMachineCollectionAmount",
 
                     (
                         COALESCE((
@@ -2443,7 +2558,7 @@ router.get(
                     INNER JOIN covered c ON c."ID"=t."SessionId"
                     INNER JOIN "CreditTypes" ct
                       ON ct."ID"=t."CreditTypeId"
-                     AND ct."LocationId"=t."LocationId"
+                     AND (ct."LocationId" IS NULL OR ct."LocationId"=t."LocationId")
                     WHERE t."LocationId"=$2
                       AND t."Type"='CASH_RECEIVED'
                       AND UPPER(COALESCE(ct."Code",''))='PULL'
@@ -2743,6 +2858,12 @@ router.get(
             // must move the Reading Session ending balance directly.
             const employeeSessionCloseAmount = weeklyReportNumber(cashMeta.employeeSessionCloseAmount)
             const machineCollectionAmount = weeklyReportNumber(cashMeta.machineCollectionAmount)
+            const calculatedMachineCollectionAmount = cashMeta.calculatedMachineCollectionAmount == null
+                ? null
+                : weeklyReportNumber(cashMeta.calculatedMachineCollectionAmount)
+            const financeShortOver = calculatedMachineCollectionAmount == null
+                ? null
+                : Number((machineCollectionAmount - calculatedMachineCollectionAmount).toFixed(2))
             const baseEndingBalance = weeklyReportNumber(cashMeta.endingBalance)
             const endingBalance = baseEndingBalance + adminCredits - adminExpenses
 
@@ -3031,6 +3152,8 @@ router.get(
                     subtotal: accountSubtotal,
                     employeeSessionCloseAmount,
                     machineCollectionAmount,
+                    calculatedMachineCollectionAmount,
+                    financeShortOver,
                     adminCredits,
                     adminExpenses,
                     ebTotal: endingBalance

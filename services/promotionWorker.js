@@ -10,13 +10,9 @@ const client = twilio(
 let running = false
 
 function buildStatusCallback() {
-  const base = process.env.PUBLIC_API_BASE_URL
-
-  if (!base) {
-    return undefined
-  }
-
-  return `${base.replace(/\/$/, '')}/promotion/twilio/status`
+  // Must be identical to the URL used by the webhook signature validator in
+  // routes/promotion.js. Do not reconstruct it from a different base URL.
+  return (process.env.TWILIO_PROMOTION_CALLBACK_URL || '').trim()
 }
 
 async function processQueuedPromotions() {
@@ -27,6 +23,11 @@ async function processQueuedPromotions() {
   running = true
 
   try {
+    const callbackUrl = buildStatusCallback()
+    if (!callbackUrl) {
+      // Keep queued recipients untouched until the callback can be verified.
+      return
+    }
     const promotionResult = await pool.query(
       `
       SELECT *
@@ -65,6 +66,20 @@ async function processQueuedPromotions() {
       )
 
       for (const recipient of recipientResult.rows) {
+        // Atomically claim the recipient before calling Twilio. A second
+        // worker/process can read the same queued row, but cannot claim it.
+        // The Sending state is deliberately not auto-retried after a crash:
+        // an external send may have succeeded before its SID was saved.
+        const claimed = await pool.query(`
+          UPDATE "PromotionRecipients"
+          SET "Status" = 'Sending', "UpdatedAt" = NOW()
+          WHERE "ID" = $1 AND "PromotionId" = $2
+            AND "Status" IN ('Pending', 'Queued')
+          RETURNING "ID"
+        `, [recipient.ID, promotion.ID])
+        if (!claimed.rowCount) continue
+
+        let message
         try {
           const messageOptions = {
             body: promotion.MessageText || '',
@@ -72,7 +87,7 @@ async function processQueuedPromotions() {
               recipient.Channel === 'WhatsApp'
                 ? `whatsapp:${recipient.Phone}`
                 : recipient.Phone,
-            statusCallback: buildStatusCallback()
+            statusCallback: callbackUrl
           }
 
           if (recipient.Channel === 'WhatsApp') {
@@ -88,11 +103,35 @@ async function processQueuedPromotions() {
             ]
           }
 
-          const message =
-            await client.messages.create(messageOptions)
+          message = await client.messages.create(messageOptions)
+        } catch (error) {
+          // No automatic retry: an interrupted Twilio request may have
+          // been delivered even when the client did not receive a response.
+          // Keep transport-ambiguous errors for manual reconciliation.
+          const isDefiniteRejection = Number(error.status) >= 400 && Number(error.status) < 500
+          await pool.query(`
+            UPDATE "PromotionRecipients"
+            SET "Status" = $2,
+                "TwilioStatus" = $3,
+                "TwilioErrorCode" = $4,
+                "TwilioErrorMessage" = $5,
+                "FailedAt" = CASE WHEN $2 = 'Failed' THEN NOW() ELSE "FailedAt" END,
+                "UpdatedAt" = NOW()
+            WHERE "ID" = $1 AND "Status" = 'Sending'
+          `, [
+            recipient.ID,
+            isDefiniteRejection ? 'Failed' : 'NeedsReview',
+            isDefiniteRejection ? 'failed' : 'unknown',
+            error.code ? String(error.code) : null,
+            error.message || 'Twilio send result is uncertain.'
+          ])
+          continue
+        }
 
-          await pool.query(
-            `
+        // Database/log failures after Twilio accepted a message must not
+        // turn the recipient back into a retryable state.
+        await pool.query(
+          `
             UPDATE "PromotionRecipients"
             SET
               "Status" = 'Sent',
@@ -100,7 +139,7 @@ async function processQueuedPromotions() {
               "TwilioStatus" = $3,
               "SentAt" = NOW(),
               "UpdatedAt" = NOW()
-            WHERE "ID" = $1
+            WHERE "ID" = $1 AND "Status" = 'Sending'
             `,
             [
               recipient.ID,
@@ -109,8 +148,8 @@ async function processQueuedPromotions() {
             ]
           )
 
-          await pool.query(
-            `
+        await pool.query(
+          `
             INSERT INTO "PromotionDeliveryLogs"
             (
               "PromotionId",
@@ -135,27 +174,7 @@ async function processQueuedPromotions() {
                 status: message.status
               })
             ]
-          )
-        } catch (error) {
-          await pool.query(
-            `
-            UPDATE "PromotionRecipients"
-            SET
-              "Status" = 'Failed',
-              "TwilioStatus" = 'failed',
-              "TwilioErrorCode" = $2,
-              "TwilioErrorMessage" = $3,
-              "FailedAt" = NOW(),
-              "UpdatedAt" = NOW()
-            WHERE "ID" = $1
-            `,
-            [
-              recipient.ID,
-              error.code ? String(error.code) : null,
-              error.message || 'Twilio send failed.'
-            ]
-          )
-        }
+        )
       }
 
       const remainingResult = await pool.query(
@@ -164,7 +183,7 @@ async function processQueuedPromotions() {
         FROM "PromotionRecipients"
         WHERE
           "PromotionId" = $1
-          AND "Status" IN ('Pending', 'Queued')
+          AND "Status" IN ('Pending', 'Queued', 'Sending', 'NeedsReview')
         `,
         [promotion.ID]
       )
@@ -186,18 +205,25 @@ async function processQueuedPromotions() {
             ? 'CompletedWithErrors'
             : 'Completed'
 
-        await pool.query(
+        const completed = await pool.query(
           `
           UPDATE "Promotions"
           SET
             "Status" = $2,
             "CompletedAt" = NOW()
           WHERE "ID" = $1
+            AND "Status" IN ('Queued', 'Processing')
+            AND NOT EXISTS (
+              SELECT 1 FROM "PromotionRecipients"
+              WHERE "PromotionId" = $1
+                AND "Status" IN ('Pending', 'Queued', 'Sending', 'NeedsReview')
+            )
+          RETURNING "ID"
           `,
           [promotion.ID, status]
         )
 
-        await writePromotionAudit(
+        if (completed.rowCount) await writePromotionAudit(
           pool,
           {
             companyId: promotion.CompanyId,

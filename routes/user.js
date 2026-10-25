@@ -5,7 +5,9 @@ const multer = require('multer')
 const router = express.Router()
 
 const { pool } = require('../db')
-const cloudinary = require('../config/cloudinary')
+const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
+const { validateImageUpload } = require('../utils/validateImageUpload')
+const { uploadBuffer } = require('../utils/imageStorage')
 const { authenticate } = require('../middleware/auth')
 
 // ============================================================
@@ -13,7 +15,7 @@ const { authenticate } = require('../middleware/auth')
 // ============================================================
 
 function looksLikeBcrypt(value = '') {
-    return /^\$2[aby]\$/.test(value)
+    return typeof value === 'string' && /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(value)
 }
 
 function normalizeRoleName(value = '') {
@@ -39,55 +41,116 @@ const profileUpload = multer({
     }
 })
 
-function uploadProfileImage(fileBuffer) {
-    return new Promise((resolve, reject) => {
-        const uploadStream =
-            cloudinary.uploader.upload_stream(
-                {
-                    folder: 'users',
-                    resource_type: 'image'
-                },
-                (error, result) => {
-                    if (error) {
-                        reject(error)
-                    } else {
-                        resolve(result)
-                    }
-                }
-            )
-
-        uploadStream.end(fileBuffer)
-    })
+async function uploadProfileImage(fileBuffer) {
+    const cloudinaryBuffer = await optimizeImageUpload(fileBuffer)
+    return uploadBuffer(cloudinaryBuffer, { folder: 'users' })
 }
 
 // ============================================================
 // LOGIN
 // ============================================================
 
-router.post(
-    '/login',
-    async (req, res) => {
-        const {
-            username,
-            password
-        } = req.body
+const crypto = require('crypto')
 
-        if (
-            !username ||
-            !password
-        ) {
-            return res.status(400).json({
-                success: false,
-                code: 40000,
-                message:
-                    'Username and password are required.'
+// PostgreSQL-backed failed-login limits: 3 failures per 60 seconds, followed by
+// a 60-second restriction. Both account and IP are counted. Shared by all
+// server instances and protected against simultaneous requests by advisory locks.
+const LOGIN_WINDOW_MS = 60 * 1000
+const LOGIN_LOCK_MS = 60 * 1000
+const LOGIN_MAX_FAILURES = 3
+const DUMMY_BCRYPT_HASH = bcrypt.hashSync('ik-login-invalid-password-placeholder', 10)
+
+function loginKeys(username, ip) {
+    const key = value => crypto.createHash('sha256').update(value).digest('hex')
+    return [key(`account:${username}`), key(`ip:${ip}`)].sort()
+}
+
+async function lockLoginKeys(client, keys) {
+    for (const key of keys) {
+        // PostgreSQL advisory locks release when the transaction completes.
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ik-login:${key}`])
+    }
+}
+
+async function readLoginLimits(client, keys, now) {
+    const result = await client.query(`
+        SELECT "Key", "FailureCount", "WindowStartedAt", "LockedUntil"
+        FROM "LoginAttemptLimits" WHERE "Key" = ANY($1::text[])
+    `, [keys])
+    const limits = new Map(result.rows.map(row => [row.Key, row]))
+    let lockUntil = 0
+    for (const row of limits.values()) {
+        const until = row.LockedUntil ? new Date(row.LockedUntil).getTime() : 0
+        if (until > now) lockUntil = Math.max(lockUntil, until)
+    }
+    return { limits, lockUntil }
+}
+
+async function recordLoginFailure(client, keys, limits, now) {
+    for (const key of keys) {
+        const previous = limits.get(key)
+        const windowStart = previous?.WindowStartedAt
+            ? new Date(previous.WindowStartedAt).getTime() : 0
+        const lastLock = previous?.LockedUntil
+            ? new Date(previous.LockedUntil).getTime() : 0
+        const freshWindow = !windowStart || now - windowStart >= LOGIN_WINDOW_MS ||
+            (lastLock && lastLock <= now)
+        const count = freshWindow ? 1 : Number(previous.FailureCount) + 1
+        const lockUntil = count >= LOGIN_MAX_FAILURES ? new Date(now + LOGIN_LOCK_MS) : null
+        await client.query(`
+            INSERT INTO "LoginAttemptLimits"
+                ("Key", "FailureCount", "WindowStartedAt", "LockedUntil", "UpdatedAt")
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT ("Key") DO UPDATE SET
+                "FailureCount" = EXCLUDED."FailureCount",
+                "WindowStartedAt" = EXCLUDED."WindowStartedAt",
+                "LockedUntil" = EXCLUDED."LockedUntil",
+                "UpdatedAt" = NOW()
+        `, [key, count, new Date(freshWindow ? now : windowStart), lockUntil])
+    }
+}
+
+router.post('/login', async (req, res) => {
+    const username = req.body?.username
+    const password = req.body?.password
+    if (typeof username !== 'string' || typeof password !== 'string' ||
+        !username.trim() || !password || username.length > 256 || password.length > 1024) {
+        return res.status(400).json({
+            success: false, code: 40000, message: 'Valid username and password are required.'
+        })
+    }
+
+    const normalizedUsername = username.trim().toLowerCase()
+    const keys = loginKeys(normalizedUsername, req.ip || req.socket.remoteAddress || 'unknown')
+    const client = await pool.connect().catch(error => {
+        console.error('Login database connection error:', error)
+        return null
+    })
+    if (!client) {
+        return res.status(500).json({ success: false, code: 50000, message: 'Unable to sign in.' })
+    }
+
+    const resultResponse = (status, data) => ({ status, data })
+    let inTransaction = false
+    try {
+        await client.query('BEGIN')
+        inTransaction = true
+        await lockLoginKeys(client, keys)
+        const now = Date.now()
+        const { limits, lockUntil } = await readLoginLimits(client, keys, now)
+        if (lockUntil > now) {
+            await client.query('COMMIT')
+            inTransaction = false
+            res.set('Retry-After', String(Math.max(1, Math.ceil((lockUntil - now) / 1000))))
+            return res.status(429).json({
+                success: false, code: 42900,
+                message: 'Too many failed login attempts. Try again in one minute.'
             })
         }
 
-        try {
-            const result =
-                await pool.query(
-                    `
+        const processLogin = async () => {
+            const result = await client.query(
+`
                     SELECT
                         u."ID",
                         u."Username",
@@ -158,61 +221,24 @@ router.post(
                         LOWER($1)
 
                     LIMIT 1
-                    `,
-                    [
-                        username.trim()
-                    ]
-                )
+                    `, [normalizedUsername])
+            const user = result.rows[0]
+            // Perform a bcrypt comparison even for nonexistent accounts to
+            // reduce username-enumeration timing differences.
+            const validPassword = user?.IsActive && looksLikeBcrypt(user.Password)
+                ? await bcrypt.compare(password, user.Password)
+                : (await bcrypt.compare(password, DUMMY_BCRYPT_HASH), false)
 
-            if (
-                !result.rowCount ||
-                !result.rows[0].IsActive
-            ) {
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        'Invalid username or password.',
-                    code: 40100
+            if (!validPassword) {
+                await recordLoginFailure(client, keys, limits, now)
+                return resultResponse(401, {
+                    success: false, code: 40100, message: 'Invalid username or password.'
                 })
             }
 
-            const user =
-                result.rows[0]
-
-            let validPassword =
-                false
-
-            // ====================================================
-            // PASSWORD CHECK
-            // ====================================================
-
-            if (
-                looksLikeBcrypt(
-                    user.Password
-                )
-            ) {
-                validPassword =
-                    await bcrypt.compare(
-                        password,
-                        user.Password
-                    )
-            } else {
-                validPassword =
-                    password ===
-                    user.Password
-            }
-
-            if (
-                !validPassword
-            ) {
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        'Invalid username or password.',
-                    code: 40100
-                })
-            }
-
+            // Correct credentials reset the failed-attempt counters. Preserve
+            // existing company/location suspension checks and response format.
+            await client.query('DELETE FROM "LoginAttemptLimits" WHERE "Key" = ANY($1::text[])', [keys])
             const roleName =
                 normalizeRoleName(
                     user.RoleName
@@ -232,7 +258,7 @@ router.post(
                 if (
                     !user.LocationId
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -243,7 +269,7 @@ router.post(
                 if (
                     !user.CompanyId
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -255,7 +281,7 @@ router.post(
                     user.CompanyIsSuspended ===
                     true
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -273,7 +299,7 @@ router.post(
                     user.CompanyIsActive ===
                     false
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -291,7 +317,7 @@ router.post(
                     user.LocationIsSuspended ===
                     true
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -309,7 +335,7 @@ router.post(
                     user.LocationIsActive ===
                     false
                 ) {
-                    return res.status(403).json({
+                    return resultResponse(403, {
                         success: false,
                         code: 40300,
                         message:
@@ -324,91 +350,40 @@ router.post(
                 }
             }
 
-            // ====================================================
-            // UPGRADE OLD PLAINTEXT PASSWORD
-            // ====================================================
 
-            if (
-                !looksLikeBcrypt(
-                    user.Password
-                )
-            ) {
-                const hash =
-                    await bcrypt.hash(
-                        password,
-                        10
-                    )
+            // Issue a fresh, unpredictable session token with a fixed expiry.
+            // The existing frontend token property and header contract are unchanged.
+            const sessionToken = crypto.randomBytes(32).toString('hex')
+            await client.query(`
+                UPDATE "Users"
+                SET "token" = $1,
+                    "TokenExpiresAt" = NOW() + INTERVAL '24 hours',
+                    "DateUpdated" = NOW()
+                WHERE "ID" = $2
+            `, [sessionToken, user.ID])
 
-                await pool.query(
-                    `
-                    UPDATE
-                        "Users"
-
-                    SET
-                        "Password" = $1,
-                        "DateUpdated" = NOW()
-
-                    WHERE
-                        "ID" = $2
-                    `,
-                    [
-                        hash,
-                        user.ID
-                    ]
-                )
-            }
-
-            // ====================================================
-            // SUCCESS
-            // ====================================================
-
-            return res.status(200).json({
-                success: true,
-                message:
-                    'Login successful!',
-                code: 20000,
-
-                token:
-                    user.token,
-
-                userid:
-                    user.ID,
-
-                locationid:
-                    user.LocationId,
-
-                locationname:
-                    user.locationname,
-
-                companyid:
-                    user.CompanyId || null,
-
-                companyname:
-                    user.CompanyName || '',
-
-                roleid:
-                    user.RoleId,
-
-                rolename:
-                    user.RoleName
-            })
-
-        } catch (err) {
-            console.error(
-                'Login error:',
-                err
-            )
-
-            return res.status(500).json({
-                success: false,
-                code: 50000,
-                message:
-                    'Internal server error. ' +
-                    err.message
+            return resultResponse(200, {
+                success: true, message: 'Login successful!', code: 20000,
+                token: sessionToken, userid: user.ID,
+                locationid: user.LocationId, locationname: user.locationname,
+                companyid: user.CompanyId || null,
+                companyname: user.CompanyName || '',
+                roleid: user.RoleId, rolename: user.RoleName
             })
         }
+
+        const response = await processLogin()
+        await client.query('COMMIT')
+        inTransaction = false
+        return res.status(response.status).json(response.data)
+    } catch (error) {
+        if (inTransaction) await client.query('ROLLBACK').catch(() => {})
+        console.error('Login error:', error)
+        return res.status(500).json({ success: false, code: 50000, message: 'Unable to sign in.' })
+    } finally {
+        client.release()
     }
-)
+})
 
 // ============================================================
 // USER INFO
@@ -416,22 +391,22 @@ router.post(
 
 router.get(
     '/userinfo',
+    authenticate,
     async (req, res) => {
         const {
-            token,
             userid,
             locationid
         } = req.query
 
-        if (
-            !token ||
-            !userid
-        ) {
-            return res.status(400).json({
+        // Keep the existing userid contract, but never accept session tokens
+        // in URLs (which can be retained by browser/proxy access logs).
+        if (!Number.isSafeInteger(Number(userid)) || Number(userid) <= 0 ||
+            Number(userid) !== Number(req.authUser.id)) {
+            return res.status(403).json({
                 success: false,
-                code: 40000,
+                code: 40300,
                 message:
-                    'Token and user ID are required.'
+                    'User access denied.'
             })
         }
 
@@ -448,7 +423,6 @@ router.get(
                         u."ID",
                         u."Username",
                         u."Name",
-                        u."token",
                         u."Avatar",
                         u."LocationId",
                         u."RoleId",
@@ -515,10 +489,6 @@ router.get(
 
                         AND
 
-                        u."token" = $2
-
-                        AND
-
                         u."IsActive" = true
 
                         AND
@@ -528,8 +498,7 @@ router.get(
                     LIMIT 1
                     `,
                     [
-                        userid,
-                        token
+                        req.authUser.id
                     ]
                 )
 
@@ -1045,8 +1014,7 @@ router.get(
                 success: false,
                 code: 50000,
                 message:
-                    'Internal server error. ' +
-                    err.message
+                    'Internal server error.'
             })
         }
     }
@@ -1063,6 +1031,7 @@ router.put(
     '/profile',
     authenticate,
     profileUpload.single('avatar'),
+    validateImageUpload,
     async (req, res) => {
         try {
             const userId =
@@ -1084,12 +1053,12 @@ router.put(
                 })
             }
 
-            if (!name) {
+            if (!name || name.length > 100 || typeof req.body?.name !== 'string') {
                 return res.status(400).json({
                     success: false,
                     code: 40000,
                     message:
-                        'Name is required.'
+                        'Name must be between 1 and 100 characters.'
                 })
             }
 
@@ -1193,17 +1162,8 @@ router.put(
             const userId =
                 Number(req.authUser?.id)
 
-            const currentPassword =
-                String(
-                    req.body?.currentPassword ||
-                    ''
-                )
-
-            const newPassword =
-                String(
-                    req.body?.newPassword ||
-                    ''
-                )
+            const currentPassword = req.body?.currentPassword
+            const newPassword = req.body?.newPassword
 
             if (
                 !Number.isInteger(userId) ||
@@ -1218,8 +1178,12 @@ router.put(
             }
 
             if (
+                typeof currentPassword !== 'string' ||
+                typeof newPassword !== 'string' ||
                 !currentPassword ||
-                !newPassword
+                !newPassword ||
+                currentPassword.length > 1024 ||
+                newPassword.length > 1024
             ) {
                 return res.status(400).json({
                     success: false,
@@ -1264,8 +1228,7 @@ router.put(
                         currentPassword,
                         storedPassword
                     )
-                    : currentPassword ===
-                        storedPassword
+                    : false
 
             if (!validCurrentPassword) {
                 return res.status(400).json({
@@ -1282,8 +1245,7 @@ router.put(
                         newPassword,
                         storedPassword
                     )
-                    : newPassword ===
-                        storedPassword
+                    : false
 
             if (samePassword) {
                 return res.status(400).json({
@@ -1300,7 +1262,7 @@ router.put(
                     10
                 )
 
-            await pool.query(
+            const updated = await pool.query(
                 `
                 UPDATE
                     "Users"
@@ -1309,12 +1271,26 @@ router.put(
                     "DateUpdated" = NOW()
                 WHERE
                     "ID" = $2
+                    AND "Password" = $3
+                    AND "IsActive" = true
+                RETURNING "ID"
                 `,
                 [
                     passwordHash,
-                    userId
+                    userId,
+                    storedPassword
                 ]
             )
+
+            // Another request may have changed the password after it was
+            // checked. Do not overwrite a newer password using stale proof.
+            if (!updated.rowCount) {
+                return res.status(409).json({
+                    success: false,
+                    code: 40900,
+                    message: 'Password changed during this request. Please try again.'
+                })
+            }
 
             return res.status(200).json({
                 success: true,

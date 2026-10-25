@@ -53,6 +53,7 @@ router.get('/list', requireModuleAccess('promotions.templates'), async (req, res
         "CompanyId" AS companyid,
         "Name" AS name,
         "Description" AS description,
+        "DesignJson" AS designjson,
         "TemplateType" AS templatetype,
         "SourceTemplateId" AS sourcetemplateid,
         "PreviewImageUrl" AS previewimageurl,
@@ -520,12 +521,12 @@ router.post(
         error
       )
 
-      return res.status(500).json({
+      const status = error?.status === 400 ? 400 : 500
+      return res.status(status).json({
         success: false,
-        code: 50000,
+        code: status * 100,
         message:
-          error.message ||
-          'Unable to upload promotion image.'
+          status === 400 ? 'Invalid promotion image.' : 'Unable to upload promotion image.'
       })
     }
   }
@@ -541,6 +542,30 @@ router.post('/generate', requireModuleAccess('promotions.templates'), async (req
       imagebase64,
       designjson
     } = req.body
+
+    const templateId = Number(id)
+    if (!Number.isSafeInteger(templateId) || templateId <= 0) {
+      return res.status(400).json({ success: false, code: 40000, message: 'Valid template ID is required.' })
+    }
+
+    // The frontend sends a data URL containing a rendered poster. Reject
+    // malformed or oversized content before sending it to cloud storage.
+    if (typeof imagebase64 !== 'string' ||
+        !/^data:image\/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(imagebase64) ||
+        imagebase64.length > 15 * 1024 * 1024) {
+      return res.status(400).json({ success: false, code: 40000, message: 'Valid poster image (up to 15 MB encoded) is required.' })
+    }
+
+    const editable = await pool.query(`
+      SELECT 1 FROM "PromotionTemplates"
+      WHERE "ID"=$1 AND "CompanyId"=$2
+        AND "IsSystemTemplate"=false
+        AND COALESCE("IsDeleted",false)=false
+      LIMIT 1
+    `, [templateId, cid])
+    if (!editable.rowCount) {
+      return res.status(404).json({ success: false, code: 40400, message: 'Editable template not found.' })
+    }
 
     const imageUrl =
       await uploadPromotionImage(imagebase64)
@@ -558,12 +583,13 @@ router.post('/generate', requireModuleAccess('promotions.templates'), async (req
         "ID" = $1
         AND "CompanyId" = $2
         AND "IsSystemTemplate" = false
+        AND COALESCE("IsDeleted", false) = false
       RETURNING
         "ID" AS id,
         "FinalImageUrl" AS finalimageurl
       `,
       [
-        Number(id),
+        templateId,
         cid,
         designjson ? JSON.stringify(designjson) : null,
         imageUrl,
@@ -602,10 +628,11 @@ router.post('/generate', requireModuleAccess('promotions.templates'), async (req
   } catch (error) {
     console.error(error)
 
-    return res.status(500).json({
+    const status = error?.status === 400 ? 400 : 500
+    return res.status(status).json({
       success: false,
-      code: 50000,
-      message: 'Unable to generate final image.'
+      code: status * 100,
+      message: status === 400 ? 'Invalid promotion image.' : 'Unable to generate final image.'
     })
   }
 })

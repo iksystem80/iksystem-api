@@ -1,32 +1,99 @@
 const express = require('express')
 const multer = require('multer')
+const { validateImageUpload } = require('../utils/validateImageUpload')
 const path = require('path')
+const sharp = require('sharp')
+const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
-const cloudinary = require('../config/cloudinary')
+const { uploadBuffer } = require('../utils/imageStorage')
 const pgvector = require('pgvector')
 const { initFaceApi, createFaceEmbedding, FaceDetectionError } = require('../face')
 const { checkMatchEligibility } = require('../utils/matchRules')
 const { setSocketIO } = require('../utils/realtime')
 
-const uploadToCloudinary = (fileBuffer, folder) => {
-    return new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-            {
-                folder: folder,
-                resource_type: 'image',
-            },
-            (error, result) => {
-                if (error) {
-                    reject(error)
-                } else {
-                    resolve(result)
+// Several image-upload endpoints put locationid inside a JSON form field.
+// Resolve that location after multer parses the body, then check database
+// assignments independently of the generic module-permission middleware.
+async function requireCustomerUploadLocation(req, res, next) {
+    try {
+        const nested = req.body?.customer ?? req.body?.checkindata ??
+            req.body?.checkoutdata ?? req.body?.matchdata
+        let details = {}
+        if (nested !== undefined) {
+            details = typeof nested === 'string' ? JSON.parse(nested) : nested
+        }
+        const locationid = Number(details?.locationid ?? req.body?.locationid ?? req.query?.locationid)
+        if (!Number.isSafeInteger(locationid) || locationid <= 0) {
+            return res.status(400).json({ success: false, code: 40000, message: 'Valid locationid is required.' })
+        }
+
+        const location = await pool.query(
+            'SELECT "CompanyId" FROM "Locations" WHERE "ID"=$1 LIMIT 1',
+            [locationid]
+        )
+        if (!location.rowCount) {
+            return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+        }
+        const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+        if (role !== 'system admin') {
+            if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
+            }
+            if (role !== 'owner') {
+                const user = await pool.query(`
+                    SELECT 1 FROM "Users" u
+                    WHERE u."ID"=$1 AND COALESCE(u."IsActive",true)=true
+                      AND (u."LocationId"=$2 OR ($3='admin' AND EXISTS (
+                          SELECT 1 FROM "UserLocationAccess" ula
+                          WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+                      ))) LIMIT 1
+                `, [Number(req.authUser?.id), locationid, role])
+                if (!user.rowCount) {
+                    return res.status(403).json({ success: false, code: 40300, message: 'Location access denied.' })
                 }
             }
-        )
+        }
+        next()
+    } catch (error) {
+        if (error instanceof SyntaxError) {
+            return res.status(400).json({ success: false, code: 40000, message: 'Invalid customer form data.' })
+        }
+        console.error('Customer upload location authorization:', error)
+        return res.status(500).json({ success: false, code: 50000, message: 'Unable to verify location access.' })
+    }
+}
 
-        uploadStream.end(fileBuffer)
-    })
+// Inspect the image before uploading it to Cloudinary. This does not modify
+// the image buffer or the separate face-embedding/matching pipeline.
+async function validateCustomerCloudImage(fileBuffer) {
+    const invalid = () => Object.assign(new Error('Invalid customer photo.'), { status: 400 })
+    if (!Buffer.isBuffer(fileBuffer) || !fileBuffer.length || fileBuffer.length > 5 * 1024 * 1024) {
+        throw invalid()
+    }
+
+    let metadata
+    try {
+        metadata = await sharp(fileBuffer, { limitInputPixels: 40_000_000 }).metadata()
+    } catch (_) {
+        throw invalid()
+    }
+
+    // Exclude active formats such as SVG even if the client calls them image/*.
+    const allowed = new Set(['jpeg', 'png', 'webp', 'heif', 'avif', 'gif'])
+    if (!allowed.has(metadata.format) || !metadata.width || !metadata.height ||
+        metadata.width > 10000 || metadata.height > 10000 ||
+        metadata.width * metadata.height > 40_000_000) throw invalid()
+}
+
+const uploadToCloudinary = async (fileBuffer, folder) => {
+    await validateCustomerCloudImage(fileBuffer)
+    // Match Points evidence can be compressed. Registration/check-in photos
+    // used by face recognition always retain their original image bytes.
+    const cloudinaryBuffer = folder === 'MatchPoints'
+        ? await optimizeImageUpload(fileBuffer)
+        : fileBuffer
+    return uploadBuffer(cloudinaryBuffer, { folder })
 }
 
 // ============================================================
@@ -67,12 +134,44 @@ module.exports = function (io) {
         '/savecustomer',
         requireModuleAccess('customers'),
         upload.single('image'),
+        validateImageUpload,
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const { customer } = req.body
 
                 const mycustomer =
                     JSON.parse(customer)
+
+                const phone = String(mycustomer.phone || '').trim()
+                const locationId = Number(mycustomer.locationid)
+
+                if (!phone || !Number.isInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Valid phone number and location are required.',
+                        code: 40000
+                    })
+                }
+
+                // A phone can be registered at different locations, but only
+                // once within the same location. Check before face processing
+                // and Cloudinary upload to avoid unnecessary work.
+                const existingCustomer = await pool.query(
+                    `SELECT "ID" FROM "Customer"
+                     WHERE "locationid" = $1 AND "Phone" = $2
+                     LIMIT 1`,
+                    [locationId, phone]
+                )
+
+                if (existingCustomer.rowCount > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'This phone number is already registered at this location.',
+                        code: 40900,
+                        errorCode: 'DUPLICATE_CUSTOMER_PHONE'
+                    })
+                }
 
                 if (!req.file) {
                     return res.status(400).json({
@@ -145,10 +244,10 @@ module.exports = function (io) {
                             mycustomer.lastname,
                             mycustomer.dob || null,
                             result.secure_url,
-                            mycustomer.phone,
-                            mycustomer.locationid,
+                            phone,
+                            locationId,
                             pgvector.toSql(embedding),
-                            mycustomer.createdby,
+                            req.authUser.id,
                         ]
                     )
 
@@ -170,6 +269,22 @@ module.exports = function (io) {
                 }
             } catch (error) {
                 console.log(error)
+
+                if (error.status === 400 && error.message === 'Invalid customer photo.') {
+                    return res.status(400).json({ success: false, code: 40000, message: error.message })
+                }
+
+                // Database unique index also protects against simultaneous
+                // requests that pass the initial duplicate check.
+                if (error.code === '23505' &&
+                    error.constraint === 'customer_location_phone_unique') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'This phone number is already registered at this location.',
+                        code: 40900,
+                        errorCode: 'DUPLICATE_CUSTOMER_PHONE'
+                    })
+                }
 
                 if (
                     error instanceof
@@ -206,6 +321,7 @@ module.exports = function (io) {
         '/uploadphoto',
         requireModuleAccess('customers'),
         upload.single('image'),
+        validateImageUpload,
         async (req, res) => {
             try {
                 if (!req.file) {
@@ -248,6 +364,7 @@ module.exports = function (io) {
     router.get(
         '/getall',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {
@@ -263,15 +380,26 @@ module.exports = function (io) {
                             c."Lastname" AS lastname,
                             TO_CHAR(
                                 c."DOB",
-                                'DD/MM/YYYY'
+                                'MM/DD/YYYY'
                             ) AS dob,
                             c."avatar" AS avatar,
                             c."Phone" AS phone,
                             c."Points" AS points,
                             TO_CHAR(
                                 c."DateCreated",
-                                'DD/MM/YYYY'
+                                'MM/DD/YYYY'
                             ) AS datecreated,
+
+                            (
+                                SELECT TO_CHAR(
+                                    MAX(visit."CheckInDate"),
+                                    'MM/DD/YYYY HH12:MI AM'
+                                )
+                                FROM "CheckIn" visit
+                                WHERE visit."CustomerId" = c."ID"
+                                  AND visit."LocationId" = c."locationid"
+                            ) AS lastvisited,
+
                             c."IsActive" AS isactive,
                             c."PhoneVerified" AS phoneverified,
                             c."PhoneVerifiedAt" AS phoneverifiedat,
@@ -318,10 +446,11 @@ module.exports = function (io) {
                     return res
                         .status(200)
                         .json({
-                            success: false,
+                            success: true,
                             message:
                                 'there is no customers',
-                            code: 20000
+                            code: 20000,
+                            data: []
                         })
                 }
             } catch (error) {
@@ -350,11 +479,24 @@ module.exports = function (io) {
     router.get(
         '/getcustomerbyid',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {
-                    id
+                    id,
+                    locationid
                 } = req.query
+
+                const customerId = Number(id)
+                const locationId = Number(locationid)
+                if (!Number.isSafeInteger(customerId) || customerId <= 0 ||
+                    !Number.isSafeInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message: 'Valid customer ID and locationid are required.'
+                    })
+                }
 
                 const result =
                     await pool.query(
@@ -392,9 +534,11 @@ module.exports = function (io) {
 
                         WHERE
                             c."ID" = $1
+                            AND c."locationid" = $2
                         `,
                         [
-                            id
+                            customerId,
+                            locationId
                         ]
                     )
 
@@ -413,12 +557,12 @@ module.exports = function (io) {
                         })
                 } else {
                     return res
-                        .status(200)
+                        .status(404)
                         .json({
                             success: false,
                             message:
                                 'there is no customers',
-                            code: 20000
+                            code: 40400
                         })
                 }
             } catch (error) {
@@ -447,21 +591,35 @@ module.exports = function (io) {
     router.delete(
         '/delete',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {
-                    id
+                    id,
+                    locationid
                 } = req.query
+
+                const customerId = Number(id)
+                const locationId = Number(locationid)
+                if (!Number.isSafeInteger(customerId) || customerId <= 0 ||
+                    !Number.isSafeInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message: 'Valid customer ID and locationid are required.'
+                    })
+                }
 
                 const result =
                     await pool.query(
                         `
                         DELETE FROM "Customer"
-                        WHERE "ID" = $1
+                        WHERE "ID" = $1 AND "locationid" = $2
                         RETURNING "ID"
                         `,
                         [
-                            id
+                            customerId,
+                            locationId
                         ]
                     )
 
@@ -494,9 +652,21 @@ module.exports = function (io) {
     router.put(
         '/updatestatus',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
-                const { id } = req.query
+                const { id, locationid } = req.query
+
+                const customerId = Number(id)
+                const locationId = Number(locationid)
+                if (!Number.isSafeInteger(customerId) || customerId <= 0 ||
+                    !Number.isSafeInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message: 'Valid customer ID and locationid are required.'
+                    })
+                }
 
                 const result =
                     await pool.query(
@@ -505,12 +675,12 @@ module.exports = function (io) {
                         SET
                             "IsActive" =
                                 NOT "IsActive"
-                        WHERE "ID" = $1
+                        WHERE "ID" = $1 AND "locationid" = $2
                         RETURNING
                             "ID",
                             "IsActive"
                         `,
-                        [id]
+                        [customerId, locationId]
                     )
 
                 return res.status(200).json({
@@ -546,6 +716,8 @@ module.exports = function (io) {
         '/checkin',
         requireModuleAccess('checkin'),
         upload.single('image'),
+        validateImageUpload,
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const { checkindata } = req.body
@@ -623,7 +795,7 @@ module.exports = function (io) {
                                 success: false,
                                 matched: false,
                                 message: 'Customer not found.',
-                                code: 50000,
+                                code: 40400,
                             })
                     }
 
@@ -636,13 +808,13 @@ module.exports = function (io) {
 
                     if (distance > MAX_DISTANCE) {
                         return res
-                            .status(200)
+                            .status(404)
                             .json({
                                 success: false,
                                 matched: false,
                                 message: 'Face not recognized.',
                                 distance,
-                                code: 50000,
+                                code: 40400,
                             })
                     }
 
@@ -871,6 +1043,10 @@ module.exports = function (io) {
                     error
                 )
 
+                if (error.status === 400 && error.message === 'Invalid customer photo.') {
+                    return res.status(400).json({ success: false, code: 40000, message: error.message })
+                }
+
                 return res
                     .status(500)
                     .json({
@@ -894,6 +1070,8 @@ module.exports = function (io) {
         '/checkout',
         requireModuleAccess('checkin'),
         upload.single('image'),
+        validateImageUpload,
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 let data
@@ -934,7 +1112,7 @@ module.exports = function (io) {
                     customer = result.rows[0]
                     distance = Number(customer.distance)
                     if (distance > 0.5) {
-                        return res.status(200).json({ success: false, matched: false, message: 'Face not recognized.', distance, code: 50000 })
+                        return res.status(404).json({ success: false, matched: false, message: 'Face not recognized.', distance, code: 40400 })
                     }
                 } else {
                     const phone = String(data.phonenumber || '').replace(/\D/g, '').slice(-10)
@@ -1011,6 +1189,7 @@ module.exports = function (io) {
     router.get(
         '/getcheckin',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {
@@ -1143,9 +1322,20 @@ module.exports = function (io) {
                             ON ck."CustomerId" =
                                c."ID"
 
-                        LEFT JOIN "CustomerMatch" cm
-                            ON cm."CheckinId" =
-                               ck."ID"
+                        -- Multiple point entries (including extra matches)
+                        -- belong to one check-in; display that check-in once.
+                        LEFT JOIN LATERAL (
+                            SELECT
+                                (ARRAY_AGG(match_entry."MachineId"
+                                    ORDER BY match_entry."IsExtraMatch", match_entry."DateAssign" DESC))[1]
+                                    AS "MachineId",
+                                SUM(match_entry."Points") AS "Points",
+                                (ARRAY_AGG(match_entry."ImageUrl"
+                                    ORDER BY match_entry."IsExtraMatch", match_entry."DateAssign" DESC))[1]
+                                    AS "ImageUrl"
+                            FROM "CustomerMatch" match_entry
+                            WHERE match_entry."CheckinId" = ck."ID"
+                        ) cm ON true
 
                         LEFT JOIN "Machines" m
                             ON m."ID" =
@@ -1158,7 +1348,9 @@ module.exports = function (io) {
                         WHERE
                             ck."LocationId" = $1
                             AND ck."IsCheckOut" = false
-                            AND ck."CheckInDate" >= NOW() - INTERVAL '24 hours' 
+                            AND ck."CheckInDate" >=
+                                (NOW() AT TIME ZONE 'America/Chicago') - INTERVAL '24 hours'
+                            AND ck."CheckInDate" <= (NOW() AT TIME ZONE 'America/Chicago')
 
                         ORDER BY
                             ck."CheckInDate" DESC
@@ -1185,10 +1377,11 @@ module.exports = function (io) {
                     return res
                         .status(200)
                         .json({
-                            success: false,
+                            success: true,
                             message:
                                 'there is no customers',
                             code: 20000,
+                            data: [],
                         })
                 }
             } catch (error) {
@@ -1217,12 +1410,20 @@ module.exports = function (io) {
     router.put(
         '/approvecheckin',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
-                const {
-                    id,
-                    userid
-                } = req.query
+                const id = Number(req.query.id)
+                const locationId = Number(req.query.locationid)
+                const actingUserId = Number(req.authUser?.id)
+
+                if (![id, locationId, actingUserId].every(v => Number.isSafeInteger(v) && v > 0)) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Valid check-in and location are required.',
+                        code: 40000
+                    })
+                }
 
                 const result =
                     await pool.query(
@@ -1237,6 +1438,7 @@ module.exports = function (io) {
 
                         WHERE
                             "ID" = $2
+                            AND "LocationId" = $3
 
                         RETURNING
                             "ID",
@@ -1245,10 +1447,19 @@ module.exports = function (io) {
                             "ApprovedDate"
                         `,
                         [
-                            userid,
-                            id
+                            actingUserId,
+                            id,
+                            locationId
                         ]
                     )
+
+                if (!result.rowCount) {
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Check-in not found for this location.',
+                        code: 40400
+                    })
+                }
 
                 return res
                     .status(200)
@@ -1288,6 +1499,7 @@ module.exports = function (io) {
     router.get(
         '/checkmatcheligibility',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const customerId = Number(req.query.customerid)
@@ -1336,6 +1548,8 @@ module.exports = function (io) {
         '/saveassignmachine',
         requireModuleAccess('customers'),
         upload.single('image'),
+        validateImageUpload,
+        requireCustomerUploadLocation,
         async (req, res) => {
             const client = await pool.connect()
             try {
@@ -1412,7 +1626,7 @@ module.exports = function (io) {
                     })
                 }
 
-                const imageResult = await uploadToCloudinary(req.file.buffer, 'customers')
+                const imageResult = await uploadToCloudinary(req.file.buffer, 'MatchPoints')
 
                 await client.query(`
                     UPDATE "CheckIn"
@@ -1430,6 +1644,9 @@ module.exports = function (io) {
             } catch (error) {
                 try { await client.query('ROLLBACK') } catch {}
                 console.error('Save assigning error:', error)
+                if (error.status === 400 && error.message === 'Invalid customer photo.') {
+                    return res.status(400).json({ success: false, code: 40000, message: error.message })
+                }
                 return res.status(500).json({ success: false, message: 'Error while assigning machine.', code: 50000 })
             } finally {
                 client.release()
@@ -1448,6 +1665,8 @@ module.exports = function (io) {
         '/saveextramatch',
         requireModuleAccess('customers'),
         upload.single('image'),
+        validateImageUpload,
+        requireCustomerUploadLocation,
         async (req, res) => {
             const client = await pool.connect()
             try {
@@ -1494,7 +1713,7 @@ module.exports = function (io) {
                     return res.status(404).json({ success: false, message: 'Customer not found for this location.', code: 40400 })
                 }
 
-                const imageResult = await uploadToCloudinary(req.file.buffer, 'customers')
+                const imageResult = await uploadToCloudinary(req.file.buffer, 'MatchPoints')
                 const result = await client.query(`
                     INSERT INTO public."CustomerMatch"
                     ("CustomerId","MachineId","Points","DateAssign","ImageUrl","AssignedBy","LocationId","CheckinId","EmployeeSessionId","IsExtraMatch")
@@ -1507,6 +1726,9 @@ module.exports = function (io) {
             } catch (error) {
                 try { await client.query('ROLLBACK') } catch {}
                 console.error('Save Extra Match error:', error)
+                if (error.status === 400 && error.message === 'Invalid customer photo.') {
+                    return res.status(400).json({ success: false, code: 40000, message: error.message })
+                }
                 return res.status(500).json({ success: false, message: 'Error while saving Extra Match.', code: 50000 })
             } finally {
                 client.release()
@@ -1524,13 +1746,14 @@ module.exports = function (io) {
     router.put(
         '/updatecustomeraccount',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
-            const client = await pool.connect()
+            let client
 
             try {
                 const {
-                    userId,
                     customerid,
+                    locationid,
                     points,
                     isactive,
                     isvip,
@@ -1538,8 +1761,8 @@ module.exports = function (io) {
                     privilegedmatchrule
                 } = req.body
 
-                const actingUserId =
-                    Number(req.authUser?.id || userId)
+                const actingUserId = Number(req.authUser?.id)
+                const locationId = Number(locationid)
 
                 const customerId =
                     Number(customerid)
@@ -1562,6 +1785,8 @@ module.exports = function (io) {
                 if (
                     !Number.isInteger(customerId) ||
                     customerId <= 0 ||
+                    !Number.isSafeInteger(locationId) ||
+                    locationId <= 0 ||
                     !Number.isInteger(actingUserId) ||
                     actingUserId <= 0 ||
                     !Number.isFinite(nextPoints) ||
@@ -1569,11 +1794,12 @@ module.exports = function (io) {
                 ) {
                     return res.status(400).json({
                         success: false,
-                        message: 'Valid customer, user and point balance are required.',
+                        message: 'Valid customer, location, user and point balance are required.',
                         code: 40000
                     })
                 }
 
+                client = await pool.connect()
                 await client.query('BEGIN')
 
                 const customerResult =
@@ -1588,10 +1814,10 @@ module.exports = function (io) {
                             "VerificationMethod",
                             "PrivilegedMatchRule"
                         FROM "Customer"
-                        WHERE "ID" = $1
+                        WHERE "ID" = $1 AND "locationid" = $2
                         FOR UPDATE
                         `,
-                        [customerId]
+                        [customerId, locationId]
                     )
 
                 if (!customerResult.rowCount) {
@@ -1702,7 +1928,7 @@ module.exports = function (io) {
                             "IsActive" = $3,
                             "IsVIP" = $4,
                             "IsBlacklist" = $5
-                        WHERE "ID" = $6
+                        WHERE "ID" = $6 AND "locationid" = $7
                         RETURNING
                             "ID" AS id,
                             "Points" AS points,
@@ -1719,7 +1945,8 @@ module.exports = function (io) {
                             nextIsActive,
                             nextIsVip,
                             nextIsBlacklist,
-                            customerId
+                            customerId,
+                            locationId
                         ]
                     )
 
@@ -1733,7 +1960,7 @@ module.exports = function (io) {
                 })
             } catch (error) {
                 try {
-                    await client.query('ROLLBACK')
+                    if (client) await client.query('ROLLBACK')
                 } catch {}
 
                 console.error(
@@ -1747,7 +1974,7 @@ module.exports = function (io) {
                     code: 50000
                 })
             } finally {
-                client.release()
+                if (client) client.release()
             }
         }
     )
@@ -1760,11 +1987,24 @@ module.exports = function (io) {
     router.get(
         '/getcustomerlogs',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {
-                    id
+                    id,
+                    locationid
                 } = req.query
+
+                const customerId = Number(id)
+                const locationId = Number(locationid)
+                if (!Number.isSafeInteger(customerId) || customerId <= 0 ||
+                    !Number.isSafeInteger(locationId) || locationId <= 0) {
+                    return res.status(400).json({
+                        success: false,
+                        code: 40000,
+                        message: 'Valid customer ID and locationid are required.'
+                    })
+                }
 
                 const result =
                     await pool.query(
@@ -1783,12 +2023,18 @@ module.exports = function (io) {
 
                         WHERE
                             "CustomerID" = $1
+                            AND EXISTS (
+                                SELECT 1 FROM "Customer" c
+                                WHERE c."ID" = "CustomerLog"."CustomerID"
+                                  AND c."locationid" = $2
+                            )
 
                         ORDER BY
                             "DateCreated" DESC
                         `,
                         [
-                            id
+                            customerId,
+                            locationId
                         ]
                     )
 
@@ -1834,6 +2080,7 @@ module.exports = function (io) {
     router.get(
         '/getcustomeractivity',
         requireModuleAccess('customers'),
+        requireCustomerUploadLocation,
         async (req, res) => {
             try {
                 const {

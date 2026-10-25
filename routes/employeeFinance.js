@@ -1,4 +1,5 @@
 const express = require('express')
+const { createHash } = require('crypto')
 const router = express.Router()
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
@@ -72,9 +73,22 @@ async function authorizedLocation(db, req, locationId) {
     if (!result.rowCount) return false
     if (String(req.authUser.roleName || '').trim().toLowerCase() === 'system admin') return true
     if (Number(result.rows[0].CompanyId) !== Number(req.authUser.companyId)) return false
-    // Regular employees can only interact with their own assigned location.
-    if (!isAdmin(req) && Number(req.authUser.locationId) !== Number(locationId)) return false
-    return true
+    const role = String(req.authUser.roleName || '').trim().toLowerCase()
+    if (role === 'owner') return true
+    // Resolve current primary/assigned locations from the database. Do not
+    // rely on a location retained in the authenticated request after access
+    // has been removed or the user's primary location has changed.
+    const access = await db.query(`
+        SELECT 1 FROM "Users" u
+        WHERE u."ID"=$1
+          AND COALESCE(u."IsActive",true)=true
+          AND (u."LocationId"=$2 OR ($3='admin' AND EXISTS (
+              SELECT 1 FROM "UserLocationAccess" ula
+              WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+          )))
+        LIMIT 1
+    `, [Number(req.authUser.id), Number(locationId), role])
+    return access.rowCount > 0
 }
 
 async function ownSession(db, req, sessionId, lock = false) {
@@ -346,12 +360,83 @@ router.get('/credit-types', requireModuleAccess('transaction.employee'), async (
         if (!req.authUser?.id || !validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
         const locationId = Number(req.query.locationid)
         if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
-        const result = await pool.query(`SELECT "ID" AS id, "Name" AS name, "Code" AS code, "IsActive" AS "isActive"
+        const result = await pool.query(`
+            SELECT
+                "ID" AS id,
+                "Name" AS name,
+                "Code" AS code,
+                "IsActive" AS "isActive",
+                "LocationId" AS "locationId",
+                ("LocationId" IS NULL) AS "isGlobal"
             FROM "CreditTypes"
-            WHERE "LocationId"=$1 AND "IsActive"=true
-            ORDER BY "Name"`, [locationId])
+            WHERE "IsActive"=true
+              AND ("LocationId" IS NULL OR "LocationId"=$1)
+            ORDER BY ("LocationId" IS NULL) DESC, "Name"
+        `, [locationId])
         return ok(res, result.rows)
     } catch (e) { console.error('Finance credit types:', e); return fail(res, 500, 'Unable to load credit types.') }
+})
+
+// Admin management list: global defaults + credit types created by the current location.
+router.get('/credit-types/manage', requireModuleAccess('transaction.admin'), async (req, res) => {
+    try {
+        if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
+        if (!validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+
+        const result = await pool.query(`
+            SELECT
+                "ID" AS id,
+                "Name" AS name,
+                "Code" AS code,
+                "IsActive" AS "isActive",
+                "LocationId" AS "locationId",
+                ("LocationId" IS NULL) AS "isGlobal",
+                "CreatedAt" AS "createdAt"
+            FROM "CreditTypes"
+            WHERE "LocationId" IS NULL OR "LocationId"=$1
+            ORDER BY ("LocationId" IS NULL) DESC, "Name"
+        `, [locationId])
+
+        return ok(res, result.rows)
+    } catch (e) {
+        console.error('Finance credit type management:', e)
+        return fail(res, 500, 'Unable to load credit types.')
+    }
+})
+
+// Separate loan tracking. These read-only balances do not change session cash arithmetic.
+router.get('/loan-lenders', requireModuleAccess('transaction.employee'), async (req, res) => {
+    try {
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+        const result = await pool.query(`
+            SELECT u."ID" AS id,
+                   COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'User') AS name,
+                   r."Name" AS role,
+                   COALESCE(loans.outstanding,0)::numeric(14,2) AS outstanding
+            FROM "Users" u
+            JOIN "Roles" r ON r."ID"=u."RoleId"
+            JOIN "Locations" ul ON ul."ID"=u."LocationId"
+            JOIN "Locations" current_location ON current_location."ID"=$1
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(SUM(l."Amount") FILTER (WHERE l."EntryType"='LOAN'),0)
+                     - COALESCE(SUM(l."Amount") FILTER (WHERE l."EntryType"='REPAYMENT'),0) AS outstanding
+                FROM "EmployeeLoanLedger" l
+                WHERE l."LocationId"=$1 AND l."EmployeeId"=$2 AND l."LenderId"=u."ID"
+            ) loans ON true
+            WHERE ul."CompanyId"=current_location."CompanyId"
+              AND (u."LocationId"=$1 OR EXISTS (
+                  SELECT 1 FROM "UserLocationAccess" ula
+                  WHERE ula."UserId"=u."ID" AND ula."LocationId"=$1
+              ))
+              AND LOWER(BTRIM(r."Name")) IN ('owner','admin','manager')
+              AND COALESCE(u."IsActive",true)=true
+              AND u."ID"<>$2
+            ORDER BY name`, [locationId, Number(req.authUser.id)])
+        return ok(res, result.rows)
+    } catch (e) { console.error('Loan lenders:', e); return fail(res, 500, 'Unable to load loan lenders.') }
 })
 
 // Employee session and live transaction ledger; authenticated user identity is server-derived.
@@ -360,7 +445,7 @@ router.get('/current', requireModuleAccess('transaction.employee'), async (req, 
         if (!req.authUser?.id || !validId(req.query.locationid)) return fail(res, 400, 'Valid location is required.')
         const locationId = Number(req.query.locationid)
         if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
-        const sessionResult = await pool.query(`SELECT "ID" AS id, "ClockIn" AS "clockIn", "ClockOut" AS "clockOut"
+        const sessionResult = await pool.query(`SELECT "ID" AS id, "SessionNumber" AS "sessionNumber", "ClockIn" AS "clockIn", "ClockOut" AS "clockOut"
             FROM "EmployeeSession" WHERE "UserId" = $1 AND "LocationId" = $2 AND "ClockOut" IS NULL
             ORDER BY "ClockIn" DESC LIMIT 1`, [Number(req.authUser.id), locationId])
         const session = sessionResult.rows[0] || null
@@ -370,8 +455,11 @@ router.get('/current', requireModuleAccess('transaction.employee'), async (req, 
                 WHERE "LocationId" = $1
                   AND "IsGeneral" = TRUE
                 ORDER BY "Name"`, [locationId]),
-            pool.query(`SELECT "ID" AS id, "Name" AS name, "Code" AS code, "IsActive" AS "isActive"
-                FROM "CreditTypes" WHERE "LocationId" = $1 ORDER BY "Name"`, [locationId])
+            pool.query(`SELECT "ID" AS id, "Name" AS name, "Code" AS code, "IsActive" AS "isActive",
+                       "LocationId" AS "locationId", ("LocationId" IS NULL) AS "isGlobal"
+                FROM "CreditTypes"
+                WHERE "LocationId" IS NULL OR "LocationId" = $1
+                ORDER BY ("LocationId" IS NULL) DESC, "Name"`, [locationId])
         ])
         const pending = await pool.query(`SELECT h."ID" AS id, h."Amount" AS amount,
             h."CreatedAt" AS "createdAt", h."Notes" AS notes, h."FromSessionId" AS "fromSessionId",
@@ -438,7 +526,14 @@ router.get('/current', requireModuleAccess('transaction.employee'), async (req, 
             COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Admin') AS name
             FROM "Users" u
             INNER JOIN "Roles" r ON r."ID" = u."RoleId"
-            WHERE u."LocationId" = $1
+            JOIN "Locations" primary_location ON primary_location."ID"=u."LocationId"
+            JOIN "Locations" selected_location ON selected_location."ID"=$1
+            WHERE primary_location."CompanyId"=selected_location."CompanyId"
+              AND (u."LocationId"=$1 OR EXISTS (
+                  SELECT 1 FROM "UserLocationAccess" ula
+                  WHERE ula."UserId"=u."ID" AND ula."LocationId"=$1
+              ))
+              AND COALESCE(u."IsActive",true)=true
               AND LOWER(BTRIM(r."Name")) = 'admin'
             ORDER BY name`, [locationId])
 
@@ -565,10 +660,13 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
                       ON r."ID"=u."RoleId"
                     WHERE a."LocationId"=$1
                       AND a."Kind"='ADMIN'
-                      AND u."LocationId"=$1
+                      AND (u."LocationId"=$1 OR EXISTS (
+                          SELECT 1 FROM "UserLocationAccess" ula
+                          WHERE ula."UserId"=u."ID" AND ula."LocationId"=$1
+                      ))
                       AND COALESCE(u."IsActive",true)=true
                       AND LOWER(BTRIM(r."Name"))='admin'
-                    ORDER BY a."ID" ASC
+                    ORDER BY (u."LocationId"=$1) DESC, a."ID" ASC
                     LIMIT 1
                     FOR UPDATE OF a`,
                     [s.LocationId])
@@ -580,7 +678,7 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
                     return fail(
                         res,
                         409,
-                        'Opening Bank cannot be released because this location does not have a funded primary Admin cash account.'
+                        'Opening Bank cannot be released because this location does not have an available Admin cash account.'
                     )
                 }
 
@@ -679,7 +777,24 @@ router.post('/opening', requireModuleAccess('transaction.employee'), async (req,
     }
 })
 
+// Optional retry protection for employee Add Bank / Expense requests.
+// Uses CashMovementIdempotency, created during Security Fix 7.
+function employeeTransactionIdempotency(req) {
+    const key = req.get('Idempotency-Key')
+    if (key === undefined) return { enabled: false }
+    if (typeof key !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(key)) {
+        return { error: 'Invalid Idempotency-Key header.' }
+    }
+    return {
+        enabled: true,
+        key,
+        digest: createHash('sha256').update(JSON.stringify(req.body || {})).digest('hex')
+    }
+}
+
 router.post('/transaction', requireModuleAccess('transaction.employee'), async (req, res) => {
+    const idem = employeeTransactionIdempotency(req)
+    if (idem.error) return fail(res, 400, idem.error)
     const client = await pool.connect()
     try {
         const amount = money(req.body.amount)
@@ -691,29 +806,98 @@ router.post('/transaction', requireModuleAccess('transaction.employee'), async (
         if (!s) { await client.query('ROLLBACK'); return fail(res, 403, 'Session access denied.') }
         if (s.ClockOut) { await client.query('ROLLBACK'); return fail(res, 409, 'Session is closed.') }
         await client.query('SELECT pg_advisory_xact_lock(80471,$1::integer)', [s.LocationId])
+
+        // The existing location advisory lock serializes retries across processes.
+        // Scope keys to actor + location + route and bind to the full request payload.
+        const idemIdentity = [Number(req.authUser.id), Number(s.LocationId), '/transaction', idem.key]
+        if (idem.enabled) {
+            const previous = await client.query(`
+                SELECT "PayloadHash", "Response"
+                FROM "CashMovementIdempotency"
+                WHERE "UserId"=$1 AND "LocationId"=$2 AND "Route"=$3 AND "RequestKey"=$4
+                FOR UPDATE`, idemIdentity)
+            if (previous.rowCount) {
+                await client.query('COMMIT')
+                if (previous.rows[0].PayloadHash !== idem.digest)
+                    return fail(res, 409, 'This request key was already used for a different operation.')
+                return res.status(200).json(previous.rows[0].Response)
+            }
+        }
         // CASH_RECEIVED is the internal ledger type for the UI action "Add Bank":
         // a credit into the authenticated user's current active session.
 
         const sum = (await client.query(balanceQuery, [s.ID])).rows[0]
         if (!sum.entry_count) { await client.query('ROLLBACK'); return fail(res, 409, 'Enter or confirm opening cash first.') }
         let expenseTypeId = null, creditTypeId = null
+        let loanAction = null
         if (type === 'EXPENSE') {
             if (!validId(req.body.expensetypeid)) { await client.query('ROLLBACK'); return fail(res, 400, 'Expense type required.') }
-            const t = await client.query(`SELECT "ID" FROM "ExpenseTypes" WHERE "ID"=$1 AND "LocationId"=$2 AND "IsActive"=true AND "IsGeneral"=true`,
+            const t = await client.query(`SELECT "ID", "Name" FROM "ExpenseTypes" WHERE "ID"=$1 AND "LocationId"=$2 AND "IsActive"=true AND "IsGeneral"=true`,
                 [Number(req.body.expensetypeid), s.LocationId])
             if (!t.rowCount) { await client.query('ROLLBACK'); return fail(res, 400, 'Invalid or inactive expense type.') }
             if (Number(sum.balance) < Number(amount)) { await client.query('ROLLBACK'); return fail(res, 409, 'Insufficient session cash.') }
             expenseTypeId = Number(req.body.expensetypeid)
+            if (String(t.rows[0].Name || '').trim().replace(/[\s_-]+/g, ' ').toLowerCase() === 'loan return') loanAction = 'REPAYMENT'
         } else {
             if (!validId(req.body.credittypeid)) { await client.query('ROLLBACK'); return fail(res, 400, 'Credit type required.') }
-            const t = await client.query(`SELECT "ID" FROM "CreditTypes" WHERE "ID"=$1 AND "LocationId"=$2 AND "IsActive"=true`,
+            const t = await client.query(`SELECT "ID", "Name", "Code" FROM "CreditTypes" WHERE "ID"=$1 AND ("LocationId" IS NULL OR "LocationId"=$2) AND "IsActive"=true`,
                 [Number(req.body.credittypeid), s.LocationId])
             if (!t.rowCount) { await client.query('ROLLBACK'); return fail(res, 400, 'Invalid or inactive credit type.') }
             creditTypeId = Number(req.body.credittypeid)
+            if (creditTypeId === 5) loanAction = 'LOAN'
         }
-        await client.query(`INSERT INTO "SessionCashTransactions"
+
+        let lenderId = null
+        if (loanAction) {
+            if (!validId(req.body.lenderid)) { await client.query('ROLLBACK'); return fail(res, 400, 'Select the loan lender.') }
+            lenderId = Number(req.body.lenderid)
+            const lender = await client.query(`
+                SELECT u."ID" FROM "Users" u
+                JOIN "Roles" r ON r."ID"=u."RoleId"
+                JOIN "Locations" lender_location ON lender_location."ID"=u."LocationId"
+                JOIN "Locations" session_location ON session_location."ID"=$2
+                WHERE u."ID"=$1 AND lender_location."CompanyId"=session_location."CompanyId"
+                  AND (u."LocationId"=$2 OR EXISTS (
+                      SELECT 1 FROM "UserLocationAccess" ula
+                      WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+                  ))
+                  AND LOWER(BTRIM(r."Name")) IN ('owner','admin','manager')
+                  AND COALESCE(u."IsActive",true)=true AND u."ID"<>$3`,
+                [lenderId, s.LocationId, s.UserId])
+            if (!lender.rowCount) { await client.query('ROLLBACK'); return fail(res, 400, 'Invalid loan lender.') }
+            // Location advisory lock serializes loan repayments as well as cash movements.
+            if (loanAction === 'REPAYMENT') {
+                const outstanding = await client.query(`
+                    SELECT COALESCE(SUM("Amount") FILTER (WHERE "EntryType"='LOAN'),0)
+                         - COALESCE(SUM("Amount") FILTER (WHERE "EntryType"='REPAYMENT'),0) AS remaining
+                    FROM "EmployeeLoanLedger"
+                    WHERE "LocationId"=$1 AND "EmployeeId"=$2 AND "LenderId"=$3`,
+                    [s.LocationId, s.UserId, lenderId])
+                const remainingCents = Math.round(Number(outstanding.rows[0].remaining || 0) * 100)
+                if (Math.round(Number(amount) * 100) > remainingCents) {
+                    await client.query('ROLLBACK')
+                    return fail(res, 409, 'Loan return cannot exceed the outstanding loan balance.')
+                }
+            }
+        }
+
+        const inserted = await client.query(`INSERT INTO "SessionCashTransactions"
             ("SessionId","LocationId","Type","Amount","ExpenseTypeId","CreditTypeId","Notes","CreatedBy")
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [s.ID, s.LocationId, type, amount, expenseTypeId, creditTypeId, note(req.body.notes), s.UserId])
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING "ID"`, [s.ID, s.LocationId, type, amount, expenseTypeId, creditTypeId, note(req.body.notes), s.UserId])
+        if (loanAction) {
+            await client.query(`INSERT INTO "EmployeeLoanLedger"
+                ("LocationId","EmployeeId","LenderId","EmployeeSessionId","CashTransactionId","EntryType","Amount","CreatedBy","Notes")
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+                [s.LocationId, s.UserId, lenderId, s.ID, inserted.rows[0].ID, loanAction, amount, s.UserId, note(req.body.notes)])
+        }
+        const response = { success: true, code: 20000, message: 'Transaction recorded.', data: null }
+        if (idem.enabled) {
+            await client.query(`
+                INSERT INTO "CashMovementIdempotency"
+                    ("UserId", "LocationId", "Route", "RequestKey", "PayloadHash", "Response")
+                VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+                [...idemIdentity, idem.digest, JSON.stringify(response)])
+        }
         await client.query('COMMIT')
 
         emitAppRefresh(
@@ -727,7 +911,7 @@ router.post('/transaction', requireModuleAccess('transaction.employee'), async (
             }
         )
 
-        return ok(res, null, 'Transaction recorded.')
+        return res.status(200).json(response)
     } catch (e) { await client.query('ROLLBACK'); console.error('Finance transaction:', e); return fail(res, 500, 'Unable to record transaction.') }
     finally { client.release() }
 })
@@ -772,6 +956,7 @@ router.post('/transfer-to-employee', requireModuleAccess('transaction.employee')
             WHERE es."UserId"=$1
               AND es."LocationId"=$2
               AND es."ClockOut" IS NULL
+              AND u."LocationId"=$2
               AND u."IsActive"=true
               AND LOWER(BTRIM(r."Name"))='employee'
             ORDER BY es."ClockIn" DESC
@@ -943,7 +1128,17 @@ router.post('/close-to-admin-and-clockout', requireModuleAccess('transaction.emp
             FROM "Users" u
             INNER JOIN "Roles" r ON r."ID"=u."RoleId"
             WHERE u."ID"=$1
-              AND u."LocationId"=$2
+              AND (u."LocationId"=$2 OR EXISTS (
+                  SELECT 1 FROM "UserLocationAccess" ula
+                  WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+              ))
+              AND EXISTS (
+                  SELECT 1 FROM "Locations" primary_location
+                  JOIN "Locations" session_location ON session_location."ID"=$2
+                  WHERE primary_location."ID"=u."LocationId"
+                    AND primary_location."CompanyId"=session_location."CompanyId"
+              )
+              AND COALESCE(u."IsActive",true)=true
               AND LOWER(BTRIM(r."Name"))='admin'
             LIMIT 1`,
             [Number(req.body.toadminid), s.LocationId])
@@ -1097,7 +1292,7 @@ router.get('/history', requireModuleAccess('transaction.employee'), async (req, 
 
         const range = quickRange(req.query.range)
         const records = await pool.query(`
-            SELECT es."ID" AS id, es."ClockIn" AS "clockIn", es."ClockOut" AS "clockOut",
+            SELECT es."ID" AS id, es."SessionNumber" AS "sessionNumber", es."ClockIn" AS "clockIn", es."ClockOut" AS "clockOut",
                 COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                 cash.opening, cash.received, cash."cashExpenses", cash."ownerWithdrawals",
                 points."pointsExpense", points."pointsCount",
@@ -1182,7 +1377,7 @@ router.get('/history/report', requireModuleAccess('transaction.employee'), async
             : { rows: [] }
 
         const records = await pool.query(`
-            SELECT es."ID" AS id, es."ClockIn" AS "clockIn", es."ClockOut" AS "clockOut",
+            SELECT es."ID" AS id, es."SessionNumber" AS "sessionNumber", es."ClockIn" AS "clockIn", es."ClockOut" AS "clockOut",
                 es."UserId" AS "employeeId",
                 COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                 cash.opening, cash.received, cash."cashExpenses", cash."ownerWithdrawals",
@@ -1293,7 +1488,7 @@ router.get('/reading-profit/:sessionId', requireModuleAccess('transaction.employ
 
         const result = await pool.query(`
             SELECT p."ID" AS id, p."ReadingSessionId" AS "readingSessionId",
-                   p."Amount" AS amount, p."PostedBy" AS "postedBy",
+                   p."Amount" AS amount, p."CalculatedAmount" AS "calculatedAmount", p."PostedBy" AS "postedBy",
                    p."PostedAt" AS "postedAt", p."Notes" AS notes,
                    COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'User') AS "postedByName"
             FROM "ReadingProfitPostings" p
@@ -1338,7 +1533,7 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
 
         const existing = await client.query(`
             SELECT p."ID" AS id, p."ReadingSessionId" AS "readingSessionId",
-                   p."Amount" AS amount, p."PostedBy" AS "postedBy",
+                   p."Amount" AS amount, p."CalculatedAmount" AS "calculatedAmount", p."PostedBy" AS "postedBy",
                    p."PostedAt" AS "postedAt", p."Notes" AS notes,
                    COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'User') AS "postedByName"
             FROM "ReadingProfitPostings" p
@@ -1397,12 +1592,21 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
 
         const totalDailyOut = Number(dailyOutResult.rows[0]?.totalDailyOut || 0)
         const machineCollection = expectedRemaining + totalDailyOut
+        // The expected collection is always server-derived. The Admin enters
+        // the physical amount actually counted; both values are retained.
+        const actualCollection = money(req.body.actualamount, true)
+        if (actualCollection === null) {
+            await client.query('ROLLBACK')
+            return fail(res, 400, 'Enter actual cash collected (zero or more, up to two decimals).')
+        }
+        const actualCollectionNumber = Number(actualCollection)
 
         if (
             !Number.isFinite(totalPull) ||
             !Number.isFinite(expectedRemaining) ||
             !Number.isFinite(totalDailyOut) ||
-            !Number.isFinite(machineCollection)
+            !Number.isFinite(machineCollection) ||
+            !Number.isFinite(actualCollectionNumber) || machineCollection < 0
         ) {
             await client.query('ROLLBACK')
             return fail(res, 500, 'Unable to calculate reading reconciliation amounts.')
@@ -1410,21 +1614,22 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
 
         const inserted = await client.query(`
             INSERT INTO "ReadingProfitPostings"
-                ("LocationId","ReadingSessionId","Amount","PostedBy","Notes")
-            VALUES ($1,$2,$3,$4,$5)
+                ("LocationId","ReadingSessionId","Amount","CalculatedAmount","PostedBy","Notes")
+            VALUES ($1,$2,$3,$4,$5,$6)
             RETURNING "ID" AS id, "ReadingSessionId" AS "readingSessionId",
-                      "Amount" AS amount, "PostedBy" AS "postedBy",
+                      "Amount" AS amount, "CalculatedAmount" AS "calculatedAmount", "PostedBy" AS "postedBy",
                       "PostedAt" AS "postedAt", "Notes" AS notes`,
             [
                 locationId,
                 sessionId,
+                actualCollection,
                 machineCollection.toFixed(2),
                 Number(req.authUser.id),
-                `Machine collection from reading session #${sessionId} · Profit ${profit.toFixed(2)} · PULL ${totalPull.toFixed(2)} · Remaining ${expectedRemaining.toFixed(2)} · Daily OUT ${totalDailyOut.toFixed(2)} · Collection ${machineCollection.toFixed(2)}`
+                `Machine collection from reading session #${sessionId} · Profit ${profit.toFixed(2)} · PULL ${totalPull.toFixed(2)} · Remaining ${expectedRemaining.toFixed(2)} · Daily OUT ${totalDailyOut.toFixed(2)} · Calculated ${machineCollection.toFixed(2)} · Actual ${actualCollection}`
             ])
 
         // Physical machine collection = expected remaining + Machine Daily OUT.
-        if (machineCollection > 0) {
+        if (actualCollectionNumber > 0) {
             await client.query('SELECT pg_advisory_xact_lock(80471,$1::integer)', [locationId])
             await client.query(`INSERT INTO "LocationCashAccounts" ("LocationId","Kind","UserId")
                 VALUES ($1,'ADMIN',$2) ON CONFLICT DO NOTHING`, [locationId, Number(req.authUser.id)])
@@ -1436,10 +1641,10 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
                 [
                     locationId,
                     accountResult.rows[0].ID,
-                    machineCollection.toFixed(2),
+                    actualCollection,
                     inserted.rows[0].id,
                     Number(req.authUser.id),
-                    `Physical machine collection · Reading session #${sessionId} · Remaining ${expectedRemaining.toFixed(2)} + Daily OUT ${totalDailyOut.toFixed(2)}`
+                    `Physical machine collection · Reading session #${sessionId} · Expected ${machineCollection.toFixed(2)} · Actual ${actualCollection}`
                 ])
         }
 
@@ -1457,7 +1662,9 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
                 totalPull,
                 expectedRemaining,
                 totalDailyOut,
-                machineCollection
+                machineCollection,
+                actualCollection: actualCollectionNumber,
+                financeVariance: actualCollectionNumber - machineCollection
             }
         }, 'Reading reconciliation posted to finance and physical machine collection credited to collector custody.')
     } catch (e) {
@@ -1672,7 +1879,7 @@ router.post('/admin/reading-session-credit', requireModuleAccess(["transaction.a
             SELECT "ID","Name"
             FROM "CreditTypes"
             WHERE "ID"=$1
-              AND "LocationId"=$2
+              AND ("LocationId" IS NULL OR "LocationId"=$2)
               AND COALESCE("IsActive",true)=true
             LIMIT 1`, [creditTypeId, locationId])
 
@@ -1725,7 +1932,7 @@ router.get('/admin/current-money-trail', requireModuleAccess('transaction.employ
 
         const result = await pool.query(`
             SELECT
-                es."ID" AS id,
+                es."ID" AS id, es."SessionNumber" AS "sessionNumber",
                 es."UserId" AS "employeeId",
                 COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
                 es."ClockIn" AS "clockIn",
@@ -1922,7 +2129,7 @@ router.get('/admin/cash-ledger', requireModuleAccess('transaction.employee'), as
                     WHEN e."Kind"='EMPLOYEE_SUPPORT' AND e."FundingId" IS NULL THEN 'Employee Opening Bank'
                     WHEN e."Kind"='EMPLOYEE_SUPPORT' THEN 'Employee Funding'
                     WHEN e."Kind"='BANK_WITHDRAWAL' THEN 'Bank Withdrawal'
-                    WHEN e."Kind"='OWNER_DISTRIBUTION' THEN 'Owner Distribution'
+                    WHEN e."Kind"='OWNER_DISTRIBUTION' THEN 'Admin Withdrawal'
                     WHEN e."Kind"='TRANSFER' AND e."Amount">0 THEN 'Transfer In'
                     WHEN e."Kind"='TRANSFER' AND e."Amount"<0 THEN 'Transfer Out'
                     ELSE INITCAP(REPLACE(e."Kind",'_',' '))
@@ -1931,6 +2138,18 @@ router.get('/admin/cash-ledger', requireModuleAccess('transaction.employee'), as
             LEFT JOIN "ExpenseTypes" et ON et."ID"=e."ExpenseTypeId"
             WHERE e."LocationId"=$1
               AND e."AccountId"=$2
+              -- Only filter this Admin Transactions display. The live custody
+              -- balance still uses the full unfiltered ledger elsewhere.
+              AND e."CreatedAt" > COALESCE((
+                  SELECT MAX(p."PostedAt")
+                  FROM "ReadingProfitPostings" p
+                  JOIN "ReadingSessions" rs
+                    ON rs."ID" = p."ReadingSessionId"
+                   AND rs."LocationId" = p."LocationId"
+                  WHERE p."LocationId" = $1
+                    AND rs."Status" = 3
+                    AND COALESCE(rs."isDeleted", false) = false
+              ), '-infinity'::timestamptz)
             ORDER BY e."CreatedAt" ASC, e."ID" ASC`,
             [locationId, account.rows[0].ID])
 
@@ -1971,7 +2190,7 @@ router.post('/admin/add-bank', requireModuleAccess(["transaction.admin", "operat
             SELECT "ID","Name"
             FROM "CreditTypes"
             WHERE "ID"=$1
-              AND "LocationId"=$2
+              AND ("LocationId" IS NULL OR "LocationId"=$2)
               AND COALESCE("IsActive",true)=true
             LIMIT 1`,
             [creditTypeId, locationId])
@@ -2102,6 +2321,142 @@ router.get('/admin/activity', requireModuleAccess('transaction.employee'), async
     } catch (e) { console.error('Finance activity:', e); return fail(res, 500, 'Unable to load financial activity.') }
 })
 
+// Read-only report for Admin custody. Historical balances are formed from the full
+// signed ledger BEFORE the requested date window is applied.
+async function loadAdminCustodyHistory(locationId, adminUserId) {
+    // Read-only custody event report. Every amount is taken from the existing
+        // signed custody ledger; no finance posting or balance rules are changed.
+        const custodyEventsResult = await pool.query(`
+            SELECT e."ID" AS id, e."CreatedAt" AS "createdAt",
+                   e."Kind" AS kind, e."Amount"::numeric(14,2) AS amount,
+                   e."FundingId" AS "fundingId", e."ReadingProfitPostingId" AS "postingId",
+                   e."CreatedBy" AS "createdBy", e."Notes" AS notes,
+                   COALESCE(NULLIF(BTRIM(creator."Name"),''),creator."Username") AS "creatorName",
+                   COALESCE(NULLIF(BTRIM(recipient."Name"),''),recipient."Username") AS "recipientName",
+                   f."Status" AS "fundingStatus", f."FundingType" AS "fundingType",
+                   f."ToUserId" AS "toUserId",
+                   rp."CalculatedAmount"::numeric(14,2) AS "calculatedPosting"
+            FROM "LocationCashEntries" e
+            JOIN "LocationCashAccounts" a ON a."ID"=e."AccountId"
+            LEFT JOIN "Users" creator ON creator."ID"=e."CreatedBy"
+            LEFT JOIN "AdminCashFunding" f ON f."ID"=e."FundingId"
+            LEFT JOIN "Users" recipient ON recipient."ID"=f."ToUserId"
+            LEFT JOIN "ReadingProfitPostings" rp ON rp."ID"=e."ReadingProfitPostingId"
+            WHERE a."LocationId"=$1 AND a."Kind"='ADMIN' AND a."UserId"=$2
+            ORDER BY e."CreatedAt" ASC, e."ID" ASC`,
+            [locationId, Number(adminUserId)])
+
+        const chicagoDate = value => new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date(value))
+        const cents = value => Math.round(Number(value || 0) * 100)
+        const entries = custodyEventsResult.rows.map(e => ({
+            ...e, date: chicagoDate(e.createdAt), amountCents: cents(e.amount)
+        }))
+        // Display a day's machine posting with its last employee shift closing.
+        // If there is no closing that day, keep an independent Collection row.
+        // This is presentation grouping only: each underlying entry is counted once.
+        const byDate = new Map()
+        for (const entry of entries) {
+            if (!byDate.has(entry.date)) byDate.set(entry.date, [])
+            byDate.get(entry.date).push(entry)
+        }
+        const grouped = []
+        for (const dailyEntries of byDate.values()) {
+            const closingEntries = dailyEntries.filter(e => e.kind === 'EMPLOYEE_CASH_TAKEN' && e.amountCents > 0)
+            const collections = dailyEntries.filter(e => e.kind === 'MACHINE_COLLECTION')
+            const closing = closingEntries[closingEntries.length - 1]
+            const attached = new Set()
+            if (closing && collections.length) {
+                const combined = [closing, ...collections]
+                const latest = combined.reduce((a, e) =>
+                    new Date(a.createdAt) > new Date(e.createdAt) ||
+                    (new Date(a.createdAt).getTime() === new Date(e.createdAt).getTime() && Number(a.id) > Number(e.id)) ? a : e)
+                grouped.push({ entries: combined, sortAt: latest.createdAt, sortId: Number(latest.id),
+                    kind: 'SHIFT_CLOSING', closingEntry: closing })
+                for (const item of combined) attached.add(Number(item.id))
+            }
+            for (const entry of dailyEntries) {
+                if (!attached.has(Number(entry.id))) {
+                    grouped.push({ entries: [entry], sortAt: entry.createdAt, sortId: Number(entry.id), kind: entry.kind })
+                }
+            }
+        }
+        grouped.sort((a,b) => new Date(a.sortAt) - new Date(b.sortAt) || a.sortId - b.sortId)
+        let balanceCents = 0
+        const custodyHistory = grouped.map(group => {
+            const delta = group.entries.reduce((total,e) => total + e.amountCents,0)
+            const before = balanceCents
+            balanceCents += delta
+            const primary = group.closingEntry || group.entries[0]
+            const capital = group.kind === 'INITIAL_CAPITAL'
+            const funding = group.kind === 'EMPLOYEE_SUPPORT' && primary.amountCents < 0
+            const isCollection = group.kind === 'MACHINE_COLLECTION'
+            const isClosing = group.kind === 'SHIFT_CLOSING' || group.kind === 'EMPLOYEE_CASH_TAKEN'
+            const collection = group.entries.filter(e => e.kind === 'MACHINE_COLLECTION')
+                .reduce((n,e) => n + e.amountCents,0)
+            const matchSession = String(primary.notes || '').match(/session\s*#(\d+)/i)
+            let type = group.kind === 'OWNER_DISTRIBUTION' ? 'Admin Withdrawal' : capital ? 'Initial Capital' : funding
+                ? (primary.fundingType === 'INITIAL_OPENING' || (primary.notes || '').includes('Opening Bank')
+                    ? 'Opening Balance' : 'Additional Cash')
+                : isClosing ? 'Shift Closing' : isCollection ? 'Machine Collection'
+                : primary.kind.replace(/_/g,' ').toLowerCase().replace(/\b\w/g,c=>c.toUpperCase())
+            return {
+                id: `${primary.id}-${group.kind}`, date: primary.date,
+                fromName: group.kind === 'OWNER_DISTRIBUTION' ? 'Admin' : capital ? 'Owner' : funding ? 'Admin' : isClosing ? (primary.creatorName || 'Employee') : '—',
+                toName: group.kind === 'OWNER_DISTRIBUTION' ? 'Outside Business' : capital ? 'Admin' : funding ? (primary.recipientName || (primary.fundingId ? 'Employee' : primary.creatorName) || 'Employee')
+                    : isClosing ? 'Admin' : 'Admin',
+                type, status: 'Posted', notes: primary.notes,
+                sessionId: matchSession ? Number(matchSession[1]) : null,
+                // Initial capital is the seed balance displayed in the opening column.
+                opening: (capital ? balanceCents : before + (isClosing ? group.entries.filter(e => e.kind === 'EMPLOYEE_CASH_TAKEN').reduce((n,e)=>n+e.amountCents,0) : 0)) / 100,
+                collection: collection / 100,
+                calculatedCollection: group.entries.filter(e => e.kind === 'MACHINE_COLLECTION' && e.calculatedPosting != null)
+                    .reduce((n,e) => n + cents(e.calculatedPosting),0) / 100,
+                funding: funding ? primary.amountCents / 100 : 0,
+                otherMovement: capital ? 0 : (delta - collection - (funding ? primary.amountCents : 0)) / 100,
+                closing: balanceCents / 100,
+                amount: primary.amount,
+                fundingId: primary.fundingId,
+                fundingType: primary.fundingType
+            }
+        })
+        // Pending requests have not moved cash; they cannot alter ledger closing.
+        const pendingFunding = await pool.query(`
+            SELECT f."ID" AS id, f."CreatedAt" AS "createdAt", f."Amount" AS amount,
+                   f."Notes" AS notes, f."FundingType" AS "fundingType",
+                   f."CustodySourceAccountId" AS "custodySourceAccountId",
+                   f."ToUserId" AS "toUserId", f."Status" AS status,
+                   COALESCE(NULLIF(BTRIM(src."Name"),''),src."Username",'Admin') AS "fromName",
+                   COALESCE(NULLIF(BTRIM(dst."Name"),''),dst."Username",'Employee') AS "toName"
+            FROM "AdminCashFunding" f
+            JOIN "Users" src ON src."ID"=f."FromUserId"
+            JOIN "Users" dst ON dst."ID"=f."ToUserId"
+            WHERE f."LocationId"=$1 AND f."Status"='Pending' AND f."FromUserId"=$2
+            ORDER BY f."CreatedAt" ASC, f."ID" ASC`, [locationId, Number(adminUserId)])
+        for (const f of pendingFunding.rows) {
+            if (f.status !== 'Pending') continue
+            const day = chicagoDate(f.createdAt)
+            const earlier = custodyHistory.filter(r => r.date <= day)
+            const balance = earlier.length ? earlier[earlier.length - 1].closing : 0
+            custodyHistory.push({
+                id: `pending-${f.id}`, date: day, sortAt: f.createdAt,
+                fromName: f.fromName, toName: f.toName,
+                type: f.fundingType === 'INITIAL_OPENING' ? 'Opening Balance' : 'Additional Cash',
+                status: 'Pending', opening: balance, collection: 0, funding: 0,
+                pendingAmount: Number(f.amount), otherMovement: 0, closing: balance,
+                fundingId: f.id, fundingType: f.fundingType,
+                custodySourceAccountId: f.custodySourceAccountId,
+                notes: f.notes, amount: f.amount, toUserId: f.toUserId
+            })
+        }
+        custodyHistory.sort((a,b) => a.date.localeCompare(b.date) ||
+            new Date(a.sortAt || a.date) - new Date(b.sortAt || b.date))
+        // The history is intentionally sorted oldest-first so each closing can be
+        // followed by the next opening. Only report rows are created here.
+    return custodyHistory;
+}
+
 // Owner/Admin dashboard: selectable employees, business funding,
 // reconciliation totals, and complete immutable money trail.
 router.get('/admin/overview', requireModuleAccess('transaction.employee'), async (req, res) => {
@@ -2175,16 +2530,57 @@ router.get('/admin/overview', requireModuleAccess('transaction.employee'), async
             SELECT f."ID" AS id, f."FundingType" AS "fundingType",
                    f."Amount" AS amount, f."Status" AS status,
                    f."Notes" AS notes, f."CreatedAt" AS "createdAt",
-                   f."AcceptedAt" AS "acceptedAt", f."ToSessionId" AS "toSessionId", f."CustodySourceAccountId" AS "custodySourceAccountId",
+                   f."AcceptedAt" AS "acceptedAt", f."ToSessionId" AS "toSessionId", f."ToUserId" AS "toUserId", f."CustodySourceAccountId" AS "custodySourceAccountId",
                    COALESCE(NULLIF(BTRIM(src."Name"),''),src."Username",'Owner/Admin') AS "fromName",
-                   COALESCE(NULLIF(BTRIM(dst."Name"),''),dst."Username",'Employee') AS "toName"
+                   COALESCE(NULLIF(BTRIM(dst."Name"),''),dst."Username",'Employee') AS "toName",
+                    CASE WHEN funding_debit."ID" IS NOT NULL THEN
+                        COALESCE(day_ledger."openingBalance",0)::numeric(14,2) ELSE NULL END AS "adminOpening",
+                    CASE WHEN funding_debit."ID" IS NOT NULL THEN
+                        COALESCE(day_ledger."machinePosting",0)::numeric(14,2) ELSE NULL END AS "machinePosting",
+                    CASE WHEN funding_debit."ID" IS NOT NULL THEN
+                        COALESCE(day_ledger."otherChanges",0)::numeric(14,2) ELSE NULL END AS "otherCashChanges",
+                    CASE WHEN funding_debit."ID" IS NOT NULL THEN
+                        COALESCE(day_ledger."closingBalance",0)::numeric(14,2) ELSE NULL END AS "adminClosing",
+                    COALESCE(day_ledger."calculatedPosting",0)::numeric(14,2) AS "calculatedPosting"
             FROM "AdminCashFunding" f
             JOIN "Users" src ON src."ID"=f."FromUserId"
             JOIN "Users" dst ON dst."ID"=f."ToUserId"
+            LEFT JOIN "LocationCashEntries" funding_debit
+              ON funding_debit."FundingId"=f."ID"
+             AND funding_debit."AccountId"=f."CustodySourceAccountId"
+             AND funding_debit."Kind"='EMPLOYEE_SUPPORT'
+             AND funding_debit."Amount"<0
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(SUM(e."Amount") FILTER (
+                        WHERE e."CreatedAt" < ((funding_debit."CreatedAt" AT TIME ZONE 'America/Chicago')::date::timestamp AT TIME ZONE 'America/Chicago')
+                    ),0) AS "openingBalance",
+                    COALESCE(SUM(e."Amount") FILTER (
+                        WHERE e."Kind"='MACHINE_COLLECTION'
+                          AND e."CreatedAt" >= ((funding_debit."CreatedAt" AT TIME ZONE 'America/Chicago')::date::timestamp AT TIME ZONE 'America/Chicago')
+                    ),0) AS "machinePosting",
+                    COALESCE(SUM(COALESCE(rp."CalculatedAmount",0)) FILTER (
+                        WHERE e."Kind"='MACHINE_COLLECTION'
+                          AND e."CreatedAt" >= ((funding_debit."CreatedAt" AT TIME ZONE 'America/Chicago')::date::timestamp AT TIME ZONE 'America/Chicago')
+                          AND rp."CalculatedAmount" IS NOT NULL
+                    ),0) AS "calculatedPosting",
+                    COALESCE(SUM(e."Amount") FILTER (
+                        WHERE e."Kind"<>'MACHINE_COLLECTION'
+                          AND e."CreatedAt" >= ((funding_debit."CreatedAt" AT TIME ZONE 'America/Chicago')::date::timestamp AT TIME ZONE 'America/Chicago')
+                          AND e."ID"<>funding_debit."ID"
+                    ),0) AS "otherChanges",
+                    COALESCE(SUM(e."Amount"),0) AS "closingBalance"
+                FROM "LocationCashEntries" e
+                LEFT JOIN "ReadingProfitPostings" rp ON rp."ID"=e."ReadingProfitPostingId"
+                WHERE e."AccountId"=f."CustodySourceAccountId"
+                  AND (e."CreatedAt",e."ID") <= (funding_debit."CreatedAt",funding_debit."ID")
+            ) day_ledger ON funding_debit."ID" IS NOT NULL
             WHERE f."LocationId"=$1
               AND f."CreatedAt" >= NOW() - ($2::integer * interval '1 day')
             ORDER BY f."CreatedAt" DESC, f."ID" DESC
             LIMIT 300`, [locationId, days])
+
+        const custodyHistory = await loadAdminCustodyHistory(locationId, Number(req.authUser.id));
 
         // Seven most recent withdrawals for this location (not a seven-day date filter).
         const withdrawals = await pool.query(`
@@ -2446,6 +2842,7 @@ router.get('/admin/overview', requireModuleAccess('transaction.employee'), async
             employees: employees.rows,
             cashHolders: cashHolders.rows,
             funding: funding.rows,
+            custodyHistory: custodyHistory.slice(-500),
             withdrawals: withdrawals.rows,
             summary: {
                 ...(summary.rows[0] || {}),
@@ -2457,6 +2854,31 @@ router.get('/admin/overview', requireModuleAccess('transaction.employee'), async
     } catch (e) {
         console.error('Admin finance overview:', e)
         return fail(res, 500, 'Unable to load owner/admin finance overview.')
+    }
+})
+
+// Filtered Admin custody history. Date filters affect display only, not balances.
+router.get('/admin/custody-history', requireModuleAccess('transaction.employee'), async (req, res) => {
+    try {
+        if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+        const custom = req.query.startdate != null || req.query.enddate != null
+        const dates = custom ? reportDateParams(req) : null
+        if (custom && (!dates || !dates.startDate || !dates.endDate))
+            return fail(res, 400, 'Choose a valid start and end date.')
+        const history = await loadAdminCustodyHistory(locationId, Number(req.authUser.id))
+        const today = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date())
+        const earliest = new Date(today + 'T12:00:00Z')
+        earliest.setUTCDate(earliest.getUTCDate() - 6)
+        const from = custom ? dates.startDate : earliest.toISOString().slice(0, 10)
+        const to = custom ? dates.endDate : today
+        return ok(res, history.filter(row => row.date >= from && row.date <= to))
+    } catch (e) {
+        console.error('Admin custody history:', e)
+        return fail(res, 500, 'Unable to load Admin custody history.')
     }
 })
 
@@ -2928,6 +3350,108 @@ router.get('/admin/trail/report', requireModuleAccess('transaction.employee'), a
     }
 })
 
+// Owner read-only report: withdrawals leaving all Admin custody accounts in this location.
+// Seven Chicago calendar days including today; never changes custody or financial totals.
+router.get('/owner/admin-withdrawals', requireModuleAccess('transaction.admin'), async (req, res) => {
+    try {
+        const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+        if (role !== 'owner' && role !== 'system admin') return fail(res, 403, 'Owner access required.')
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+        const result = await pool.query(`
+            SELECT e."ID" AS id, e."CreatedAt" AS "createdAt",
+                   e."Amount"::numeric(14,2) AS amount, e."Notes" AS notes,
+                   COALESCE(NULLIF(BTRIM(u."Name"),''), u."Username", 'Admin') AS "adminName"
+            FROM "LocationCashEntries" e
+            JOIN "LocationCashAccounts" a ON a."ID"=e."AccountId"
+            LEFT JOIN "Users" u ON u."ID"=a."UserId"
+            WHERE e."LocationId"=$1 AND a."LocationId"=$1
+              AND a."Kind"='ADMIN' AND e."Kind"='OWNER_DISTRIBUTION'
+              AND e."CreatedAt" >= (((NOW() AT TIME ZONE 'America/Chicago')::date - 6)::timestamp AT TIME ZONE 'America/Chicago')
+              AND e."CreatedAt" < (((NOW() AT TIME ZONE 'America/Chicago')::date + 1)::timestamp AT TIME ZONE 'America/Chicago')
+            ORDER BY e."CreatedAt" DESC, e."ID" DESC`, [locationId])
+        return ok(res, result.rows)
+    } catch (e) {
+        console.error('Owner Admin withdrawal history:', e)
+        return fail(res, 500, 'Unable to load Admin withdrawals.')
+    }
+})
+
+// Read-only, all-time Admin withdrawals. Independent of unreconciled-period filtering.
+router.get('/admin/custody-withdrawals', requireModuleAccess('transaction.admin'), async (req, res) => {
+    try {
+        if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
+            return fail(res, 403, 'Admin access required.')
+        const locationId = Number(req.query.locationid)
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+        const result = await pool.query(`
+            SELECT e."ID" AS id, e."CreatedAt" AS "createdAt",
+                   e."Amount"::numeric(14,2) AS amount, e."Notes" AS notes
+            FROM "LocationCashEntries" e
+            JOIN "LocationCashAccounts" a ON a."ID"=e."AccountId"
+            WHERE e."LocationId"=$1 AND a."LocationId"=$1
+              AND a."Kind"='ADMIN' AND a."UserId"=$2
+              AND e."Kind"='OWNER_DISTRIBUTION'
+            ORDER BY e."CreatedAt" DESC, e."ID" DESC`,
+            [locationId, Number(req.authUser.id)])
+        return ok(res, result.rows)
+    } catch (e) {
+        console.error('Admin withdrawal history:', e)
+        return fail(res, 500, 'Unable to load Admin withdrawal history.')
+    }
+})
+
+// Admin withdraws cash OUT of the business. A single signed custody debit is
+// the permanent audit record; no employee session, bank transfer or expense is created.
+router.post('/admin/custody-withdraw', requireModuleAccess('transaction.admin'), async (req, res) => {
+    const client = await pool.connect()
+    try {
+        if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
+            return fail(res, 403, 'Admin access required.')
+        const locationId = Number(req.body.locationid)
+        const amount = money(req.body.amount)
+        if (!(await authorizedLocation(client, req, locationId))) return fail(res, 403, 'Location access denied.')
+        if (amount === null) return fail(res, 400, 'Enter a positive withdrawal amount with up to two decimals.')
+
+        await client.query('BEGIN')
+        await client.query('SELECT pg_advisory_xact_lock(80471,$1::integer)', [locationId])
+        const account = await client.query(`
+            SELECT "ID" FROM "LocationCashAccounts"
+            WHERE "LocationId"=$1 AND "Kind"='ADMIN' AND "UserId"=$2
+            LIMIT 1 FOR UPDATE`, [locationId, Number(req.authUser.id)])
+        if (!account.rowCount) {
+            await client.query('ROLLBACK')
+            return fail(res, 409, 'Admin custody account does not exist.')
+        }
+        const accountId = account.rows[0].ID
+        const availableResult = await client.query(`
+            SELECT (COALESCE((SELECT SUM(e."Amount") FROM "LocationCashEntries" e
+                               WHERE e."AccountId"=$1),0)
+                    - COALESCE((SELECT SUM(f."Amount") FROM "AdminCashFunding" f
+                                WHERE f."CustodySourceAccountId"=$1 AND f."Status"='Pending'),0)
+                    - COALESCE((SELECT SUM(t."Amount") FROM "LocationCashTransfers" t
+                                WHERE t."FromAccountId"=$1 AND t."Status"='Pending'),0))::numeric(14,2) AS available`,
+            [accountId])
+        const available = Number(availableResult.rows[0]?.available || 0)
+        if (Number(amount) > available) {
+            await client.query('ROLLBACK')
+            return fail(res, 409, `Withdrawal exceeds available Admin cash ($${Math.max(0,available).toFixed(2)}).`)
+        }
+        const inserted = await client.query(`
+            INSERT INTO "LocationCashEntries" ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes")
+            VALUES ($1,$2,$3,'OWNER_DISTRIBUTION',$4,$5)
+            RETURNING "ID" AS id, "CreatedAt" AS "createdAt", "Amount" AS amount`,
+            [locationId, accountId, -Number(amount), Number(req.authUser.id), note(req.body.notes) || 'Admin cash withdrawal from business'])
+        await client.query('COMMIT')
+        emitAppRefresh(locationId, ['adminTransactions'], 'admin-custody-withdrawal', { userId: Number(req.authUser.id) })
+        return ok(res, { ...inserted.rows[0], closingBalance: (available - Number(amount)).toFixed(2) }, 'Admin cash withdrawal recorded.')
+    } catch (e) {
+        try { await client.query('ROLLBACK') } catch { }
+        console.error('Admin custody withdrawal:', e)
+        return fail(res, 500, 'Unable to record Admin withdrawal.')
+    } finally { client.release() }
+})
+
 // Owner/Admin removes physical cash from an employee's active session.
 // This is NOT an operating expense; it is a separate audited session debit.
 router.post('/admin/withdrawal', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
@@ -3316,57 +3840,267 @@ router.post('/credit-types', requireModuleAccess(["transaction.admin", "operatio
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
 
         const locationId = Number(req.body.locationid)
-        if (!(await authorizedLocation(pool, req, locationId)))
-            return fail(res, 403, 'Location access denied.')
+        if (!validId(locationId)) return fail(res, 400, 'Valid location is required.')
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
 
         const name = String(req.body.name || '').trim()
         if (!name || name.length > 100)
             return fail(res, 400, 'Credit type name must be 1–100 characters.')
 
-        // Stable business identifier. Existing UI does not need to send this;
-        // the server derives it once when the credit type is created.
-        const requestedCode = String(req.body.code || '').trim()
-        const codeSource = requestedCode || name
-        const code = codeSource
-            .toUpperCase()
-            .replace(/[^A-Z0-9]+/g, '_')
-            .replace(/^_+|_+$/g, '')
-            .slice(0, 50)
-
-        if (!code)
-            return fail(res, 400, 'Credit type code could not be generated.')
+        // Location-created credit types intentionally have no system Code.
+        // Codes are reserved for global/system credit types managed by Super Admin.
+        const duplicate = await pool.query(`
+            SELECT 1
+            FROM "CreditTypes"
+            WHERE LOWER(BTRIM("Name")) = LOWER(BTRIM($1))
+              AND ("LocationId" IS NULL OR "LocationId"=$2)
+            LIMIT 1
+        `, [name, locationId])
+        if (duplicate.rowCount) return fail(res, 409, 'Credit type already exists.')
 
         const result = await pool.query(`
             INSERT INTO "CreditTypes"
-                ("LocationId","Name","Code","CreatedBy")
-            VALUES ($1,$2,$3,$4)
+                ("LocationId","Name","Code","CreatedBy","IsActive")
+            VALUES ($1,$2,NULL,$3,true)
             RETURNING
                 "ID" AS id,
                 "Name" AS name,
-                "Code" AS code
-        `, [locationId, name, code, Number(req.authUser.id)])
+                "Code" AS code,
+                "IsActive" AS "isActive",
+                "LocationId" AS "locationId",
+                false AS "isGlobal"
+        `, [locationId, name, Number(req.authUser.id)])
 
         return ok(res, result.rows[0], 'Credit type created.')
     } catch (e) {
-        if (e.code === '23505')
-            return fail(res, 409, 'Credit type name or code already exists.')
+        if (e.code === '23505') return fail(res, 409, 'Credit type already exists.')
         console.error('Finance credit type:', e)
         return fail(res, 500, 'Unable to create credit type.')
     }
 })
 
+// Edit name and/or Active status. Global defaults are protected because LocationId must equal current location.
 router.patch('/credit-types/:id', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
     try {
         if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
+
         const locationId = Number(req.body.locationid)
+        const creditTypeId = Number(req.params.id)
+        if (!validId(locationId) || !validId(creditTypeId)) return fail(res, 400, 'Valid credit type and location are required.')
         if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
-        if (!validId(req.params.id) || typeof req.body.isactive !== 'boolean') return fail(res, 400, 'Valid credit type and status required.')
-        const result = await pool.query(`UPDATE "CreditTypes" SET "IsActive"=$1
-            WHERE "ID"=$2 AND "LocationId"=$3 RETURNING "ID" AS id`,
-            [req.body.isactive, Number(req.params.id), locationId])
-        if (!result.rowCount) return fail(res, 404, 'Credit type not found.')
+
+        const current = await pool.query(`
+            SELECT "ID" AS id, "Name" AS name, "IsActive" AS "isActive"
+            FROM "CreditTypes"
+            WHERE "ID"=$1 AND "LocationId"=$2
+        `, [creditTypeId, locationId])
+        if (!current.rowCount) return fail(res, 404, 'Location credit type not found or cannot be modified.')
+
+        const hasName = Object.prototype.hasOwnProperty.call(req.body, 'name')
+        const hasStatus = Object.prototype.hasOwnProperty.call(req.body, 'isactive')
+        if (!hasName && !hasStatus) return fail(res, 400, 'Name or active status is required.')
+
+        const name = hasName ? String(req.body.name || '').trim() : current.rows[0].name
+        const isActive = hasStatus ? req.body.isactive : current.rows[0].isActive
+
+        if (!name || name.length > 100) return fail(res, 400, 'Credit type name must be 1–100 characters.')
+        if (typeof isActive !== 'boolean') return fail(res, 400, 'Valid active status is required.')
+
+        const duplicate = await pool.query(`
+            SELECT 1
+            FROM "CreditTypes"
+            WHERE "ID"<>$1
+              AND LOWER(BTRIM("Name")) = LOWER(BTRIM($2))
+              AND ("LocationId" IS NULL OR "LocationId"=$3)
+            LIMIT 1
+        `, [creditTypeId, name, locationId])
+        if (duplicate.rowCount) return fail(res, 409, 'Credit type already exists.')
+
+        const result = await pool.query(`
+            UPDATE "CreditTypes"
+            SET "Name"=$1, "IsActive"=$2
+            WHERE "ID"=$3 AND "LocationId"=$4
+            RETURNING "ID" AS id, "Name" AS name, "Code" AS code,
+                      "IsActive" AS "isActive", "LocationId" AS "locationId",
+                      false AS "isGlobal"
+        `, [name, isActive, creditTypeId, locationId])
+
         return ok(res, result.rows[0], 'Credit type updated.')
-    } catch (e) { console.error('Finance credit status:', e); return fail(res, 500, 'Unable to update credit type.') }
+    } catch (e) {
+        if (e.code === '23505') return fail(res, 409, 'Credit type already exists.')
+        console.error('Finance credit type update:', e)
+        return fail(res, 500, 'Unable to update credit type.')
+    }
 })
+
+router.delete('/credit-types/:id', requireModuleAccess(["transaction.admin", "operations.employee-sessions", "reports.weekly"]), async (req, res) => {
+    try {
+        if (!isAdmin(req)) return fail(res, 403, 'Admin access required.')
+
+        const locationId = Number(req.query.locationid)
+        const creditTypeId = Number(req.params.id)
+        if (!validId(locationId) || !validId(creditTypeId)) return fail(res, 400, 'Valid credit type and location are required.')
+        if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+
+        const existing = await pool.query(`
+            SELECT "ID" AS id
+            FROM "CreditTypes"
+            WHERE "ID"=$1 AND "LocationId"=$2
+        `, [creditTypeId, locationId])
+        if (!existing.rowCount) return fail(res, 404, 'Location credit type not found or cannot be deleted.')
+
+        const used = await pool.query(`
+            SELECT EXISTS (
+                SELECT 1 FROM "SessionCashTransactions" WHERE "CreditTypeId"=$1
+                UNION ALL
+                SELECT 1 FROM "ReadingSessionCashTransactions" WHERE "CreditTypeId"=$1
+            ) AS used
+        `, [creditTypeId])
+        if (used.rows[0]?.used)
+            return fail(res, 409, 'This credit type is already used in transactions. Set it inactive instead of deleting it.')
+
+        await pool.query(`DELETE FROM "CreditTypes" WHERE "ID"=$1 AND "LocationId"=$2`, [creditTypeId, locationId])
+        return ok(res, { id: creditTypeId }, 'Credit type deleted.')
+    } catch (e) {
+        if (e.code === '23503') return fail(res, 409, 'This credit type is already in use. Set it inactive instead.')
+        console.error('Finance credit type delete:', e)
+        return fail(res, 500, 'Unable to delete credit type.')
+    }
+})
+
+
+// Weekly Report loan information is read-only and separate from all cash calculations.
+router.get('/reports/reading-session/:sessionId/loans',
+    requireModuleAccess(['reports.weekly', 'transaction.admin', 'operations.employee-sessions']),
+    async (req, res) => {
+        try {
+            const locationId = Number(req.query.locationid)
+            const readingSessionId = Number(req.params.sessionId)
+            if (!validId(locationId) || !validId(readingSessionId))
+                return fail(res, 400, 'Valid location and Reading Session are required.')
+            if (!(await authorizedLocation(pool, req, locationId)))
+                return fail(res, 403, 'Location access denied.')
+            if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
+
+            const found = await pool.query(`
+                SELECT 1 FROM "ReadingSessions"
+                WHERE "ID"=$1 AND "LocationId"=$2 AND COALESCE("isDeleted",false)=false`,
+                [readingSessionId, locationId])
+            if (!found.rowCount) return fail(res, 404, 'Reading Session not found.')
+
+            // Historical snapshot: never include loans or repayments created after
+            // the selected Reading Session ended. Open sessions use the current time.
+            const loans = await pool.query(`
+                WITH report_cutoff AS (
+                    SELECT COALESCE(rs."EndedAt", NOW()) AS cutoff
+                    FROM "ReadingSessions" rs
+                    WHERE rs."ID"=$2 AND rs."LocationId"=$1
+                ), covered_employees AS (
+                    SELECT DISTINCT "UserId" AS "employeeId"
+                    FROM "EmployeeSession"
+                    WHERE "LocationId"=$1 AND "ReadingSessionId"=$2
+                ), balances AS (
+                    SELECT l."EmployeeId" AS "employeeId", l."LenderId" AS "lenderId",
+                           COALESCE(SUM(l."Amount") FILTER (WHERE l."EntryType"='LOAN'),0)::numeric(14,2) AS "loanAmount",
+                           COALESCE(SUM(l."Amount") FILTER (WHERE l."EntryType"='REPAYMENT'),0)::numeric(14,2) AS "returnAmount"
+                    FROM "EmployeeLoanLedger" l
+                    JOIN covered_employees ce ON ce."employeeId"=l."EmployeeId"
+                    CROSS JOIN report_cutoff rc
+                    WHERE l."LocationId"=$1 AND l."CreatedAt"<=rc.cutoff
+                    GROUP BY l."EmployeeId",l."LenderId"
+                )
+                SELECT b.*, (b."loanAmount"-b."returnAmount")::numeric(14,2) AS "remainingBalance",
+                       COALESCE(NULLIF(BTRIM(e."Name"),''),e."Username",'Employee') AS "employeeName",
+                       COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Lender') AS "lenderName"
+                FROM balances b
+                JOIN "Users" e ON e."ID"=b."employeeId"
+                JOIN "Users" u ON u."ID"=b."lenderId"
+                WHERE b."loanAmount">b."returnAmount"
+                ORDER BY "employeeName","lenderName"`, [locationId, readingSessionId])
+
+            const history = await pool.query(`
+                SELECT l."ID" AS id, l."EmployeeId" AS "employeeId",l."LenderId" AS "lenderId",
+                       l."EmployeeSessionId" AS "employeeSessionId", l."CashTransactionId" AS "cashTransactionId",
+                       l."EntryType" AS type,l."Amount"::numeric(14,2) AS amount,
+                       l."CreatedAt" AS "createdAt",l."Notes" AS notes,
+                       COALESCE(NULLIF(BTRIM(e."Name"),''),e."Username",'Employee') AS "employeeName",
+                       COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Lender') AS "lenderName"
+                FROM "EmployeeLoanLedger" l
+                JOIN "EmployeeSession" es ON es."ID"=l."EmployeeSessionId"
+                JOIN "Users" e ON e."ID"=l."EmployeeId"
+                JOIN "Users" u ON u."ID"=l."LenderId"
+                WHERE l."LocationId"=$1 AND es."LocationId"=$1
+                  AND es."ReadingSessionId"=$2
+                ORDER BY l."CreatedAt" DESC,l."ID" DESC`, [locationId, readingSessionId])
+            return ok(res, { openLoans: loans.rows, history: history.rows })
+        } catch (e) {
+            console.error('Reading Session loan report:', e)
+            return fail(res, 500, 'Unable to load loan report.')
+        }
+    })
+
+// Dedicated Loan Report. Read-only: groups the existing loan ledger by employee/lender.
+// Existing SessionCashTransactions and all finance calculations are untouched.
+router.get('/reports/loans',
+    requireModuleAccess(['reports.weekly', 'transaction.admin', 'operations.employee-sessions']),
+    async (req, res) => {
+        try {
+            const locationId = Number(req.query.locationid)
+            if (!validId(locationId)) return fail(res, 400, 'Valid location is required.')
+            if (!isAdmin(req)) return fail(res, 403, 'Owner/Admin access required.')
+            if (!(await authorizedLocation(pool, req, locationId))) return fail(res, 403, 'Location access denied.')
+
+            const result = await pool.query(`
+                SELECT l."ID" AS id, l."EmployeeId" AS "employeeId",
+                       l."LenderId" AS "lenderId", l."EmployeeSessionId" AS "employeeSessionId",
+                       l."CashTransactionId" AS "cashTransactionId",
+                       es."ReadingSessionId" AS "readingSessionId",
+                       l."EntryType" AS type, l."Amount"::numeric(14,2) AS amount,
+                       l."CreatedAt" AS "createdAt", l."Notes" AS notes,
+                       COALESCE(NULLIF(BTRIM(employee."Name"),''),employee."Username",'Employee') AS "employeeName",
+                       COALESCE(NULLIF(BTRIM(lender."Name"),''),lender."Username",'Lender') AS "lenderName"
+                FROM "EmployeeLoanLedger" l
+                JOIN "EmployeeSession" es ON es."ID"=l."EmployeeSessionId"
+                   AND es."LocationId"=l."LocationId"
+                JOIN "Users" employee ON employee."ID"=l."EmployeeId"
+                JOIN "Users" lender ON lender."ID"=l."LenderId"
+                WHERE l."LocationId"=$1
+                ORDER BY l."CreatedAt" ASC,l."ID" ASC`, [locationId])
+
+            // Cents prevent float drift and preserve the same employee/lender/location account
+            // structure already used by the loan repayment validation.
+            const accounts = new Map()
+            for (const entry of result.rows) {
+                const key = `${entry.employeeId}:${entry.lenderId}`
+                if (!accounts.has(key)) {
+                    accounts.set(key, {
+                        employeeId: entry.employeeId, lenderId: entry.lenderId,
+                        employeeName: entry.employeeName, lenderName: entry.lenderName,
+                        loanCents: 0, returnCents: 0, entries: [], lastActivity: null
+                    })
+                }
+                const account = accounts.get(key)
+                const cents = Math.round(Number(entry.amount) * 100)
+                if (entry.type === 'LOAN') account.loanCents += cents
+                else if (entry.type === 'REPAYMENT') account.returnCents += cents
+                account.entries.push(entry)
+                account.lastActivity = entry.createdAt
+            }
+            const rows = Array.from(accounts.values()).map(account => ({
+                employeeId: account.employeeId, lenderId: account.lenderId,
+                employeeName: account.employeeName, lenderName: account.lenderName,
+                loanAmount: (account.loanCents / 100).toFixed(2),
+                returnAmount: (account.returnCents / 100).toFixed(2),
+                remainingBalance: ((account.loanCents - account.returnCents) / 100).toFixed(2),
+                status: account.loanCents > account.returnCents ? 'open' : 'closed',
+                lastActivity: account.lastActivity,
+                entries: account.entries.reverse()
+            })).sort((a, b) => new Date(b.lastActivity) - new Date(a.lastActivity))
+            return ok(res, { rows })
+        } catch (e) {
+            console.error('Loan report:', e)
+            return fail(res, 500, 'Unable to load loan report.')
+        }
+    })
 
 module.exports = router

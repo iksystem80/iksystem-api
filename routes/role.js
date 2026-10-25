@@ -23,11 +23,41 @@ function locationId(req) {
 
 async function locationAllowed(req, id) {
   if (!id) return false
+
+  // System Admin may administer any active location.
   if (isSystemAdmin(req)) {
-    const found = await pool.query('SELECT 1 FROM "Locations" WHERE "ID"=$1 AND COALESCE("IsActive",true)=true', [id])
+    const found = await pool.query(
+      'SELECT 1 FROM "Locations" WHERE "ID"=$1 AND "IsActive"=true AND COALESCE("IsSuspended",false)=false',
+      [id]
+    )
     return found.rowCount > 0
   }
-  return Number(req.authUser?.locationId) === Number(id)
+
+  // Never authorize a location outside the authenticated user's company.
+  const found = await pool.query(`
+    SELECT 1 FROM "Locations" l
+    JOIN "Companies" c ON c."ID"=l."CompanyId"
+    WHERE l."ID"=$1 AND l."CompanyId"=$2
+      AND l."IsActive"=true AND COALESCE(l."IsSuspended",false)=false
+      AND c."IsActive"=true AND COALESCE(c."IsSuspended",false)=false
+    LIMIT 1`, [id, Number(req.authUser?.companyId)]
+  )
+  if (!found.rowCount) return false
+
+  const currentId = Number(req.authUser?.locationId)
+  if (roleName(req) === 'owner') return true
+  if (currentId === Number(id)) return true
+
+  // Admin may manage explicitly assigned secondary company locations.
+  if (roleName(req) === 'admin') {
+    const access = await pool.query(`
+      SELECT 1 FROM "UserLocationAccess"
+      WHERE "UserId"=$1 AND "LocationId"=$2 LIMIT 1`,
+      [req.authUser.id, id]
+    )
+    return access.rowCount > 0
+  }
+  return false
 }
 
 async function normalizeModuleIds(db, ids, allowedIds = null) {
@@ -234,9 +264,24 @@ router.put('/:id', managerAccess, async (req, res) => {
     const loc = locationId(req)
     if (!(await locationAllowed(req, loc))) return fail(res, 403, 'Location access denied.')
     const roleId = Number(req.params.id)
-    const currentResult = await client.query('SELECT "Name","IsSystem" FROM "Roles" WHERE "ID"=$1', [roleId])
+    const currentResult = await client.query('SELECT "Name","Description","IsActive","IsSystem" FROM "Roles" WHERE "ID"=$1', [roleId])
     if (!currentResult.rowCount || String(currentResult.rows[0].Name).trim().toLowerCase() === 'system admin') return fail(res, 404, 'Role not found.')
     const current = currentResult.rows[0]
+    // Name, description and active status live in the shared Roles table.
+    // Editing them for one location would silently change other locations.
+    if (!current.IsSystem) {
+      const otherLocation = await client.query(`
+        SELECT 1 FROM "LocationRoleModules"
+        WHERE "RoleId"=$1 AND "LocationId"<>$2 LIMIT 1
+      `, [roleId, loc])
+      const changesSharedRole =
+        String(req.body.name || '').trim() !== String(current.Name || '').trim() ||
+        String(req.body.description || '') !== String(current.Description || '') ||
+        Boolean(req.body.isActive) !== Boolean(current.IsActive)
+      if (otherLocation.rowCount && changesSharedRole) {
+        return fail(res, 409, 'This role is shared by other locations. Only its location permissions can be changed.')
+      }
+    }
     const allowedRows = await client.query('SELECT "ModuleId" AS id FROM "LocationModules" WHERE "LocationId"=$1', [loc])
     const allowed = allowedRows.rows.map(x => Number(x.id))
     const moduleIds = await normalizeModuleIds(client, req.body.moduleIds, allowed)
@@ -256,12 +301,23 @@ router.put('/:id', managerAccess, async (req, res) => {
 
 router.delete('/:id', managerAccess, async (req, res) => {
   try {
-    const roleResult = await pool.query('SELECT "Name","IsSystem" FROM "Roles" WHERE "ID"=$1', [req.params.id])
+    const loc = locationId(req)
+    if (!(await locationAllowed(req, loc))) return fail(res, 403, 'Location access denied.')
+    const roleId = Number(req.params.id)
+    if (!Number.isSafeInteger(roleId) || roleId <= 0) return fail(res, 400, 'Valid role is required.')
+    const roleResult = await pool.query('SELECT "Name","IsSystem" FROM "Roles" WHERE "ID"=$1', [roleId])
     if (!roleResult.rowCount || String(roleResult.rows[0].Name).trim().toLowerCase() === 'system admin') return fail(res, 404, 'Role not found.')
     if (roleResult.rows[0].IsSystem) return fail(res, 400, 'System roles cannot be deleted.')
-    const used = await pool.query('SELECT 1 FROM "Users" WHERE "RoleId"=$1 LIMIT 1', [req.params.id])
+    // Role records are global even though their module grants are per-location.
+    // Never delete a role that another location still has configured.
+    const otherLocation = await pool.query(`
+      SELECT 1 FROM "LocationRoleModules"
+      WHERE "RoleId"=$1 AND "LocationId"<>$2 LIMIT 1
+    `, [roleId, loc])
+    if (otherLocation.rowCount) return fail(res, 409, 'Role is configured at another location and cannot be deleted.')
+    const used = await pool.query('SELECT 1 FROM "Users" WHERE "RoleId"=$1 LIMIT 1', [roleId])
     if (used.rowCount) return fail(res, 409, 'This role is assigned to users and cannot be deleted.')
-    await pool.query('DELETE FROM "Roles" WHERE "ID"=$1', [req.params.id])
+    await pool.query('DELETE FROM "Roles" WHERE "ID"=$1', [roleId])
     return ok(res, null, 'Role deleted successfully.')
   } catch (error) { console.error('Delete role error:', error); return fail(res, 500, 'Unable to delete role.') }
 })

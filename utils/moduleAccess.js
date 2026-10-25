@@ -24,10 +24,48 @@ async function ensureAuthenticated(req, res) {
     return true
 }
 
+// Resolve the target location consistently before checking module permissions.
+// External request field is locationid (lowercase); some multipart
+// endpoints use JSON-encoded form fields.
+// A conflicting/invalid explicitly supplied location fails closed (no fallback).
 function requestLocationId(req) {
-    const value = req.body?.locationid ?? req.query?.locationid ?? req.params?.locationid ?? req.authUser?.locationId
-    const id = Number(value)
-    return Number.isSafeInteger(id) && id > 0 ? id : null
+    const supplied = []
+    const add = value => {
+        if (value !== undefined && value !== null && value !== '') supplied.push(value)
+    }
+
+    for (const source of [req.body, req.query, req.params]) {
+        if (!source || typeof source !== 'object') continue
+        add(source.locationid)
+    }
+
+    // Existing customer/check-in endpoints send locationid in a JSON string
+    // within multipart/form-data. Only inspect known payload field names.
+    for (const key of ['customer', 'checkindata', 'checkoutdata', 'matchdata']) {
+        const raw = req.body?.[key]
+        if (typeof raw !== 'string') continue
+        // Bound parsing work for unauthenticated/malformed requests.
+        if (raw.length > 65536) return null
+        let payload
+        try {
+            payload = JSON.parse(raw)
+        } catch {
+            return null
+        }
+        if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+            add(payload.locationid)
+        }
+    }
+
+    if (!supplied.length) add(req.authUser?.locationId ?? req.authUser?.locationid)
+
+    const ids = supplied.map(value => {
+        if (typeof value !== 'string' && typeof value !== 'number') return null
+        const id = Number(value)
+        return Number.isSafeInteger(id) && id > 0 ? id : null
+    })
+    if (!ids.length || ids.some(id => id === null)) return null
+    return ids.every(id => id === ids[0]) ? ids[0] : null
 }
 
 async function resolveRoleId(req) {
@@ -44,7 +82,10 @@ async function hasLocationAccess(req, locationId) {
     if (isSystemAdmin(req)) return true
 
     const locationResult = await pool.query(`
-        SELECT l."ID", l."CompanyId", l."IsActive", c."IsActive" AS "CompanyIsActive"
+        SELECT l."ID", l."CompanyId", l."IsActive",
+               COALESCE(l."IsSuspended",false) AS "LocationIsSuspended",
+               c."IsActive" AS "CompanyIsActive",
+               COALESCE(c."IsSuspended",false) AS "CompanyIsSuspended"
         FROM "Locations" l
         LEFT JOIN "Companies" c ON c."ID"=l."CompanyId"
         WHERE l."ID"=$1
@@ -53,7 +94,8 @@ async function hasLocationAccess(req, locationId) {
     if (!locationResult.rowCount) return false
 
     const location = locationResult.rows[0]
-    if (location.IsActive === false || location.CompanyIsActive === false) return false
+    if (location.IsActive !== true || location.LocationIsSuspended === true ||
+        location.CompanyIsActive !== true || location.CompanyIsSuspended === true) return false
 
     const authCompanyId = Number(req.authUser?.companyId ?? req.authUser?.companyid)
     if (!Number.isSafeInteger(authCompanyId) || authCompanyId <= 0) return false

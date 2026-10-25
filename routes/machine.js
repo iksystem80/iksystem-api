@@ -27,6 +27,10 @@ function requireOwnerOrAdmin(req, res, next) {
 }
 
 async function verifyLocation(req, locationId, client = pool) {
+    if (!Number.isSafeInteger(Number(locationId)) || Number(locationId) <= 0) {
+        throw new Error('LOCATION_NOT_FOUND')
+    }
+
     const result = await client.query(`
     SELECT
       l."ID",
@@ -49,6 +53,33 @@ async function verifyLocation(req, locationId, client = pool) {
         throw new Error('LOCATION_FORBIDDEN')
     }
 
+    // Owners can manage all company locations. Admins may access their
+    // primary location and any additional location assigned to them.
+    // Other roles are limited to their primary location.
+    if (role(req) !== 'system admin' && role(req) !== 'owner') {
+        const access = await client.query(`
+            SELECT 1
+            FROM "Users" u
+            WHERE u."ID" = $1
+              AND (
+                  u."LocationId" = $2
+                  OR (
+                      $3 = 'admin'
+                      AND EXISTS (
+                          SELECT 1 FROM "UserLocationAccess" ula
+                          WHERE ula."UserId" = u."ID"
+                            AND ula."LocationId" = $2
+                      )
+                  )
+              )
+            LIMIT 1
+        `, [req.authUser.id, Number(locationId), role(req)])
+
+        if (!access.rowCount) {
+            throw new Error('LOCATION_FORBIDDEN')
+        }
+    }
+
     return location
 }
 
@@ -61,6 +92,8 @@ router.get(
                 machinenumber,
                 locationid
             } = req.query
+
+            await verifyLocation(req, Number(locationid))
 
             const result =
                 await pool.query(
@@ -97,6 +130,7 @@ router.get(
                         AND
 
                         m."locationid" = $2
+                        AND COALESCE(m."IsArchived",false)=false
 
                     ORDER BY
                         m."MachineNumber" ASC
@@ -121,25 +155,15 @@ router.get(
                 })
             }
 
-            return res.status(200).json({
+            return res.status(404).json({
                 success: false,
                 message:
                     'no machines found.',
-                code: 20000,
+                code: 40400,
             })
 
         } catch (error) {
-            console.error(
-                'Get machines error:',
-                error
-            )
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    'Error while getting machines.',
-                code: 50000,
-            })
+            return errorResponse(res, error)
         }
     }
 )
@@ -163,11 +187,13 @@ async function getMachine(req, machineId, client = pool) {
 
     const machine = result.rows[0]
 
-    if (
-        role(req) !== 'system admin' &&
-        Number(machine.CompanyId) !== Number(req.authUser.companyId)
-    ) {
-        throw new Error('MACHINE_FORBIDDEN')
+    try {
+        await verifyLocation(req, Number(machine.locationid), client)
+    } catch (error) {
+        if (error.message === 'LOCATION_FORBIDDEN' || error.message === 'LOCATION_NOT_FOUND') {
+            throw new Error('MACHINE_FORBIDDEN')
+        }
+        throw error
     }
 
     return machine
@@ -290,6 +316,7 @@ router.get(
           m.locationid,
           m."DateCreated",
           m."DateUpdated",
+          m."ReplacedMachineId",
 
           mt."TypeName" AS "MachineTypeName",
           g."GameName",
@@ -312,6 +339,7 @@ router.get(
           ON u."ID" = m."UpdatedBy"
 
         WHERE m.locationid = $1
+          AND COALESCE(m."IsArchived",false)=false
 
         ORDER BY m."MachineNumber"
       `, [locationId])
@@ -340,7 +368,7 @@ router.post(
 
         try {
             const {
-                locationId,
+                locationid,
                 startNumber,
                 endNumber,
                 machineTypeId
@@ -348,7 +376,7 @@ router.post(
 
             const start = Number(startNumber)
             const end = Number(endNumber)
-            const locId = Number(locationId)
+            const locId = Number(locationid)
 
             if (!locId || !start || !end) {
                 return res.status(400).json({
@@ -426,6 +454,7 @@ router.post(
           FROM "Machines"
           WHERE locationid = $1
             AND "MachineNumber" = $2
+            AND COALESCE("IsArchived",false)=false
         `, [locId, number])
 
                 if (existing.rowCount) {
@@ -639,7 +668,7 @@ router.put(
           "StatusReason" = $4,
           "UpdatedBy" = $5,
           "DateUpdated" = NOW()
-        WHERE "ID" = $6
+        WHERE "ID" = $6 AND COALESCE("IsArchived",false)=false
       `, [
                 newTypeId,
                 newGameId,
@@ -1212,17 +1241,19 @@ router.get(
                         m."ID",
                         m."MachineNumber",
                         m."StatusId",
+                        m."ReplacedMachineId",
                         ms."Description"
                             AS "Status",
 
-                        mr."ID"
-                            AS "InitialReadingId",
+                        initial_row."ID" AS "InitialReadingId",
 
                         mr."PreviousIn",
                         mr."PreviousOut",
                         mr."CurrentIn",
                         mr."CurrentOut",
-                        mr."ReadingAt"
+                        mr."ReadingAt",
+                        (mr."ReadingType" <> 'INITIAL') AS "IsSessionReading",
+                        rs."SessionNumber" AS "ReadingSessionNumber"
 
                     FROM
                         "Machines" m
@@ -1234,25 +1265,28 @@ router.get(
                             ms."ID" =
                                 m."StatusId"
 
-                    LEFT JOIN
-                        "MachineReadings" mr
-
-                        ON
-                            mr."MachineId" =
-                                m."ID"
-
-                            AND
-
-                            mr."SessionId"
-                                IS NULL
-
-                            AND
-
-                            mr."ReadingType" =
-                                'INITIAL'
+                    LEFT JOIN LATERAL (
+                        SELECT mr0.*
+                        FROM "MachineReadings" mr0
+                        LEFT JOIN "ReadingSessions" rs0 ON rs0."ID"=mr0."SessionId"
+                        WHERE mr0."MachineId"=m."ID"
+                          AND (
+                              (mr0."SessionId" IS NULL AND mr0."ReadingType"='INITIAL')
+                              OR (rs0."LocationId"=m.locationid AND COALESCE(rs0."isDeleted",false)=false)
+                          )
+                        ORDER BY mr0."ReadingAt" DESC NULLS LAST, mr0."ID" DESC
+                        LIMIT 1
+                    ) mr ON TRUE
+                    LEFT JOIN "ReadingSessions" rs ON rs."ID"=mr."SessionId"
+                    LEFT JOIN LATERAL (
+                        SELECT "ID" FROM "MachineReadings"
+                        WHERE "MachineId"=m."ID" AND "SessionId" IS NULL AND "ReadingType"='INITIAL'
+                        ORDER BY "ReadingAt" DESC NULLS LAST,"ID" DESC LIMIT 1
+                    ) initial_row ON TRUE
 
                     WHERE
                         m.locationid = $1
+                        AND COALESCE(m."IsArchived",false)=false
 
                     ORDER BY
                         m."MachineNumber"
@@ -1290,7 +1324,7 @@ router.put(
                 Number(req.params.machineId)
 
             const locationId =
-                Number(req.body.locationId)
+                Number(req.body.locationid)
 
             const previousIn =
                 Number(req.body.previousIn)
@@ -1351,7 +1385,7 @@ router.put(
 
             if (
                 Number(machine.locationid) !==
-                locationId
+                locationId || machine.IsArchived === true
             ) {
                 return res.status(403).json({
                     success: false,
@@ -1510,7 +1544,7 @@ router.delete(
 
             if (
                 Number(machine.locationid) !==
-                locationId
+                locationId || machine.IsArchived === true
             ) {
                 return res.status(403).json({
                     success: false,
@@ -1559,6 +1593,82 @@ router.delete(
 )
 
 // ============================================================
+// REPLACE MACHINE / BOARD (archive old identity, create fresh identity)
+// Never delete or modify existing MachineReadings or financial records.
+// ============================================================
+router.post('/replace/:machineId',
+    requireModuleAccess('settings.machines'), requireOwnerOrAdmin,
+    async (req, res) => {
+        const machineId = Number(req.params.machineId)
+        const locationId = Number(req.body.locationid)
+        const reason = String(req.body.reason || '').trim()
+        const replacementType = String(req.body.replacementType || '').trim().toUpperCase()
+        if (!Number.isSafeInteger(machineId) || machineId <= 0 ||
+            !Number.isSafeInteger(locationId) || locationId <= 0 ||
+            !['BOARD', 'MACHINE'].includes(replacementType) || !reason || reason.length > 1000) {
+            return res.status(400).json({success:false,code:40000,
+                message:'Valid machine, location, replacement type and reason are required.'})
+        }
+        const client = await pool.connect()
+        try {
+            await client.query('BEGIN')
+            await verifyLocation(req, locationId, client)
+            const selected = await client.query(`
+                SELECT * FROM "Machines" WHERE "ID"=$1 AND locationid=$2 FOR UPDATE`,
+                [machineId, locationId])
+            if (!selected.rowCount || selected.rows[0].IsArchived) {
+                await client.query('ROLLBACK')
+                return res.status(409).json({success:false,code:40900,
+                    message:'Machine is not available for replacement.'})
+            }
+            const old = selected.rows[0]
+            // A replacement while an open/reconciling session contains readings
+            // would put two physical machines into one unreconciled report.
+            const pending = await client.query(`
+                SELECT 1 FROM "MachineReadings" mr
+                JOIN "ReadingSessions" rs ON rs."ID"=mr."SessionId"
+                WHERE mr."MachineId"=$1 AND rs."LocationId"=$2
+                  AND rs."Status" IN (1,2)
+                  AND COALESCE(rs."isDeleted",false)=false LIMIT 1`,
+                [machineId,locationId])
+            if (pending.rowCount) {
+                await client.query('ROLLBACK')
+                return res.status(409).json({success:false,code:40900,
+                    message:'Finish or remove this machine from open/reconciling reading sessions before replacing it.'})
+            }
+            const activeStatus = await client.query(`
+                SELECT "ID" FROM "MachineStatus"
+                WHERE LOWER(TRIM("Description"))='working' LIMIT 1`)
+            if (!activeStatus.rowCount) throw new Error('Working machine status is not configured.')
+            await client.query(`UPDATE "Machines" SET "IsArchived"=true,
+                "ArchivedAt"=NOW(), "ArchiveReason"=$1, "UpdatedBy"=$2,
+                "DateUpdated"=NOW() WHERE "ID"=$3 AND locationid=$4`,
+                [`${replacementType}: ${reason}`,req.authUser.id,machineId,locationId])
+            const created = await client.query(`
+                INSERT INTO "Machines"
+                  ("MachineNumber","MachineTypeId","GameId","StatusId",
+                   locationid,"UpdatedBy","ReplacedMachineId")
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                RETURNING "ID" AS id,"MachineNumber" AS "machineNumber"`,
+                [old.MachineNumber, old.MachineTypeId, old.GameId,
+                 activeStatus.rows[0].ID,locationId,req.authUser.id,machineId])
+            await logChange(client,machineId,req.authUser.id,
+                'Machine Archived','Replacement',old.MachineNumber,created.rows[0].id,
+                `${replacementType}: ${reason}`)
+            await logChange(client,created.rows[0].id,req.authUser.id,
+                'Machine Replacement Created','ReplacedMachineId',null,machineId,
+                `${replacementType}: ${reason}`)
+            await client.query('COMMIT')
+            return res.json({success:true,code:20000,message:'Replacement machine created. Enter fresh initial readings.',
+                data:{oldMachineId:machineId, newMachineId:created.rows[0].id,
+                      machineNumber:created.rows[0].machineNumber}})
+        } catch (error) {
+            try { await client.query('ROLLBACK') } catch (_) {}
+            return errorResponse(res,error)
+        } finally { client.release() }
+    })
+
+// ============================================================
 // SOFT DELETE MACHINE
 // "Delete" changes StatusId to configured Inactive status.
 // Machine row and all historical references remain intact.
@@ -1577,7 +1687,7 @@ router.patch(
                 Number(req.params.machineId)
 
             const locationId =
-                Number(req.body.locationId)
+                Number(req.body.locationid)
 
             if (
                 !machineId ||
@@ -1706,5 +1816,39 @@ router.patch(
         }
     }
 )
+
+
+// Chronological history for one machine, including INITIAL and regular session readings.
+router.get('/reading-history/:machineId',
+    requireModuleAccess(["settings.machines", "reading.record"]),
+    async (req, res) => {
+        try {
+            const machineId = Number(req.params.machineId)
+            const locationId = Number(req.query.locationid)
+            if (!Number.isSafeInteger(machineId) || machineId <= 0 ||
+                !Number.isSafeInteger(locationId) || locationId <= 0) {
+                return res.status(400).json({success:false,code:40000,message:'Valid machine and location are required.'})
+            }
+            await verifyLocation(req, locationId)
+            const machine = await getMachine(req, machineId)
+            if (Number(machine.locationid) !== locationId) {
+                return res.status(403).json({success:false,code:40300,message:'Machine does not belong to this location.'})
+            }
+            const rows = await pool.query(`
+                SELECT mr."ID" AS id, mr."ReadingAt" AS "readingAt",
+                    mr."ReadingType" AS "readingType",
+                    mr."PreviousIn" AS "previousIn",mr."PreviousOut" AS "previousOut",
+                    mr."CurrentIn" AS "currentIn",mr."CurrentOut" AS "currentOut",
+                    rs."ID" AS "sessionId",rs."SessionNumber" AS "sessionNumber"
+                FROM "MachineReadings" mr
+                LEFT JOIN "ReadingSessions" rs ON rs."ID"=mr."SessionId"
+                WHERE mr."MachineId"=$1
+                  AND ((mr."SessionId" IS NULL AND mr."ReadingType"='INITIAL')
+                       OR (rs."LocationId"=$2 AND COALESCE(rs."isDeleted",false)=false))
+                ORDER BY mr."ReadingAt" DESC NULLS LAST,mr."ID" DESC`,
+                [machineId,locationId])
+            return res.json({success:true,code:20000,data:rows.rows})
+        } catch (error) { return errorResponse(res,error) }
+    })
 
 module.exports = router

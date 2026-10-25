@@ -86,8 +86,18 @@ async function getAuthenticatedUser(req) {
                     l."ID" =
                         u."LocationId"
 
+            LEFT JOIN
+                "Companies" c
+
+                ON
+                    c."ID" = l."CompanyId"
+
             WHERE
                 u."token" = $1
+
+                AND
+
+                u."TokenExpiresAt" > NOW()
 
                 AND
 
@@ -96,6 +106,21 @@ async function getAuthenticatedUser(req) {
                 AND
 
                 r."IsActive" = true
+
+                AND
+
+                (
+                    LOWER(BTRIM(r."Name")) = 'system admin'
+                    OR
+                    (
+                        l."ID" IS NOT NULL
+                        AND l."IsActive" = true
+                        AND COALESCE(l."IsSuspended", false) = false
+                        AND c."ID" IS NOT NULL
+                        AND c."IsActive" = true
+                        AND COALESCE(c."IsSuspended", false) = false
+                    )
+                )
 
             LIMIT 1
             `,

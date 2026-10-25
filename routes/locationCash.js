@@ -1,5 +1,5 @@
 const express = require('express')
-const { randomUUID } = require('crypto')
+const { randomUUID, createHash } = require('crypto')
 const router = express.Router()
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
@@ -16,13 +16,35 @@ const fail = (res, status, message) => res.status(status).json({ success: false,
 async function allowed(db, req, location) {
     if (!admin(req) || !id(location)) return false
     const r = await db.query('SELECT "CompanyId" FROM "Locations" WHERE "ID"=$1', [location])
-    return !!r.rowCount && (role(req) === 'system admin' || Number(r.rows[0].CompanyId) === Number(req.authUser.companyId))
+    if (!r.rowCount) return false
+    if (role(req) === 'system admin') return true
+    if (Number(r.rows[0].CompanyId) !== Number(req.authUser.companyId)) return false
+    if (role(req) === 'owner') return true
+    // Read current assignments from the database. The request's selected
+    // location may be stale after an Admin loses access to a location.
+    const access = await db.query(`
+        SELECT 1 FROM "Users" u
+        WHERE u."ID"=$1
+          AND COALESCE(u."IsActive",true)=true
+          AND (u."LocationId"=$2 OR EXISTS (
+              SELECT 1 FROM "UserLocationAccess" ula
+              WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+          ))
+        LIMIT 1`, [Number(req.authUser.id), Number(location)])
+    return access.rowCount > 0
 }
 async function receiver(db, location, userId, allowedRoles) {
     if (!id(userId)) return false
     const r = await db.query(`SELECT LOWER(BTRIM(r."Name")) AS role FROM "Users" u
     JOIN "Roles" r ON r."ID"=u."RoleId"
-    WHERE u."ID"=$1 AND u."LocationId"=$2 AND COALESCE(u."IsActive",true)=true`, [userId, location])
+    JOIN "Locations" primary_location ON primary_location."ID"=u."LocationId"
+    JOIN "Locations" selected_location ON selected_location."ID"=$2
+    WHERE u."ID"=$1 AND primary_location."CompanyId"=selected_location."CompanyId"
+      AND (u."LocationId"=$2 OR EXISTS (
+          SELECT 1 FROM "UserLocationAccess" ula
+          WHERE ula."UserId"=u."ID" AND ula."LocationId"=$2
+      ))
+      AND COALESCE(u."IsActive",true)=true`, [userId, location])
     return !!r.rowCount && (!allowedRoles || allowedRoles.includes(r.rows[0].role))
 }
 async function account(db, location, kind, userId) {
@@ -41,16 +63,70 @@ async function balance(db, accountId) {
 async function entry(db, location, accountId, amount, kind, actor, notes, extra = {}) {
     const r = await db.query(`INSERT INTO "LocationCashEntries" ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes","TransferId","ReadingProfitPostingId","FundingId","SessionTransactionId","CapitalId","MovementKey","ExpenseTypeId") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING "ID" AS id`, [location, accountId, amount, kind, actor, notes, extra.transferId || null, extra.postingId || null, extra.fundingId || null, extra.transactionId || null, extra.capitalId || null, extra.movementKey || null, extra.expenseTypeId || null]); return r.rows[0]
 }
+// Optional request deduplication for direct cash movements. Send a new
+// Idempotency-Key per user action; reuse it only when retrying that action.
+function idempotencyRequest(req) {
+    const raw = req.get('Idempotency-Key')
+    if (raw === undefined) return { enabled: false }
+    if (typeof raw !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(raw)) {
+        return { error: 'Invalid Idempotency-Key header.' }
+    }
+    const payload = JSON.stringify(req.body || {})
+    return {
+        enabled: true,
+        key: raw,
+        digest: createHash('sha256').update(payload).digest('hex')
+    }
+}
 async function movement(req, res, action) {
+    const idem = idempotencyRequest(req)
+    if (idem.error) return fail(res, 400, idem.error)
     const db = await pool.connect()
     try {
-        const location = Number(req.body.locationid); if (!(await allowed(db, req, location))) return fail(res, 403, 'Location access denied.')
-        const amount = money(req.body.amount); if (!amount) return fail(res, 400, 'Enter a valid positive amount.')
-        await db.query('BEGIN'); await lock(db, location)
+        const location = Number(req.body.locationid)
+        if (!(await allowed(db, req, location))) return fail(res, 403, 'Location access denied.')
+        const amount = money(req.body.amount)
+        if (!amount) return fail(res, 400, 'Enter a valid positive amount.')
+
+        await db.query('BEGIN')
+        await lock(db, location)
+        // Advisory lock serializes financial operations at this location.
+        // The unique index additionally enforces this across concurrent requests.
+        const identity = [Number(req.authUser.id), location, req.path, idem.key]
+        if (idem.enabled) {
+            const previous = await db.query(`
+                SELECT "PayloadHash", "Response"
+                FROM "CashMovementIdempotency"
+                WHERE "UserId"=$1 AND "LocationId"=$2 AND "Route"=$3 AND "RequestKey"=$4
+                FOR UPDATE`, identity)
+            if (previous.rowCount) {
+                await db.query('COMMIT')
+                if (previous.rows[0].PayloadHash !== idem.digest) {
+                    return fail(res, 409, 'This request key was already used for a different operation.')
+                }
+                return res.status(200).json(previous.rows[0].Response)
+            }
+        }
+
         const result = await action(db, location, amount)
-        if (result.error) { await db.query('ROLLBACK'); return fail(res, result.status || 409, result.error) }
-        await db.query('COMMIT'); return ok(res, result.data || null, result.message)
-    } catch (e) { try { await db.query('ROLLBACK') } catch { }; console.error('Location cash:', e); return fail(res, 500, 'Unable to record cash movement.') } finally { db.release() }
+        if (result.error) {
+            await db.query('ROLLBACK')
+            return fail(res, result.status || 409, result.error)
+        }
+        const response = { success: true, code: 20000, message: result.message || 'Success.', data: result.data || null }
+        if (idem.enabled) {
+            await db.query(`
+                INSERT INTO "CashMovementIdempotency"
+                    ("UserId", "LocationId", "Route", "RequestKey", "PayloadHash", "Response")
+                VALUES ($1,$2,$3,$4,$5,$6::jsonb)`, [...identity, idem.digest, JSON.stringify(response)])
+        }
+        await db.query('COMMIT')
+        return res.status(200).json(response)
+    } catch (e) {
+        try { await db.query('ROLLBACK') } catch { }
+        console.error('Location cash:', e)
+        return fail(res, 500, 'Unable to record cash movement.')
+    } finally { db.release() }
 }
 router.get('/overview', requireModuleAccess(["transaction.admin", "reports.weekly"]), async (req, res) => {
     try {
@@ -65,7 +141,15 @@ router.get('/overview', requireModuleAccess(["transaction.admin", "reports.weekl
         const entries = await pool.query(`SELECT e."ID" AS id,e."Kind" AS kind,e."Amount" AS amount,e."Notes" AS notes,e."CreatedAt" AS "createdAt",a."Kind" AS account,e."ReadingProfitPostingId" AS "readingProfitPostingId",e."TransferId" AS "transferId",COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Business Bank') AS holder FROM "LocationCashEntries" e JOIN "LocationCashAccounts" a ON a."ID"=e."AccountId" LEFT JOIN "Users" u ON u."ID"=a."UserId" WHERE e."LocationId"=$1 ORDER BY e."CreatedAt" DESC,e."ID" DESC LIMIT 200`, [location])
         const expenseTypes = await pool.query(`SELECT "ID" AS id,"Name" AS name FROM "ExpenseTypes" WHERE "LocationId"=$1 AND "IsActive"=true ORDER BY "Name"`, [location])
         const unlinked = await pool.query(`SELECT COUNT(*)::integer AS count,COALESCE(SUM(p."Amount"),0)::numeric(14,2) AS amount FROM "ReadingProfitPostings" p WHERE p."LocationId"=$1 AND NOT EXISTS(SELECT 1 FROM "LocationCashEntries" e WHERE e."ReadingProfitPostingId"=p."ID")`, [location])
-        const people = await pool.query(`SELECT u."ID" AS id,COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'User') AS name,LOWER(BTRIM(r."Name")) AS role FROM "Users" u JOIN "Roles" r ON r."ID"=u."RoleId" WHERE u."LocationId"=$1 AND COALESCE(u."IsActive",true)=true ORDER BY name`, [location])
+        const people = await pool.query(`SELECT u."ID" AS id,COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'User') AS name,LOWER(BTRIM(r."Name")) AS role FROM "Users" u JOIN "Roles" r ON r."ID"=u."RoleId" JOIN "Locations" primary_location ON primary_location."ID"=u."LocationId"
+        JOIN "Locations" selected_location ON selected_location."ID"=$1
+        WHERE primary_location."CompanyId"=selected_location."CompanyId"
+          AND (u."LocationId"=$1 OR (
+              LOWER(BTRIM(r."Name")) IN ('admin','system admin')
+              AND EXISTS (SELECT 1 FROM "UserLocationAccess" ula
+                  WHERE ula."UserId"=u."ID" AND ula."LocationId"=$1)
+          ))
+          AND COALESCE(u."IsActive",true)=true ORDER BY name`, [location])
         const capital = await pool.query(`SELECT c."ID" AS id,c."Amount" AS amount,c."Status" AS status,c."Notes" AS notes,c."CreatedAt" AS "createdAt",c."CreatedBy" AS "createdBy",c."AcceptedAt" AS "acceptedAt",c."AcceptedBy" AS "acceptedBy",c."CancelledAt" AS "cancelledAt",a."UserId" AS "toUserId",
       COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Admin') AS "toName" FROM "LocationCashCapital" c
       JOIN "LocationCashAccounts" a ON a."ID"=c."ToAccountId" LEFT JOIN "Users" u ON u."ID"=a."UserId"
@@ -145,7 +229,13 @@ router.post('/transfers/:id/accept', requireModuleAccess(["transaction.admin", "
         const r = await db.query(`SELECT t.*,a."UserId" AS receiver FROM "LocationCashTransfers" t JOIN "LocationCashAccounts" a ON a."ID"=t."ToAccountId" WHERE t."ID"=$1 AND t."LocationId"=$2 FOR UPDATE OF t`, [req.params.id, location]); const t = r.rows[0]
         if (!t || t.Status !== 'Pending') { await db.query('ROLLBACK'); return fail(res, 409, 'Transfer unavailable.') }
         if (Number(t.receiver) !== Number(req.authUser.id)) { await db.query('ROLLBACK'); return fail(res, 403, 'Only the designated receiver can confirm cash.') }
-        const b = await balance(db, t.FromAccountId); if (b.balance < Number(t.Amount)) { await db.query('ROLLBACK'); return fail(res, 409, 'Sender has insufficient balance.') }
+        // Pending transfers and employee support reserve custody funds. On acceptance,
+        // ensure ALL outstanding reservations (including this transfer) remain covered.
+        const b = await balance(db, t.FromAccountId)
+        if (b.balance < b.reserved || b.balance < Number(t.Amount)) {
+            await db.query('ROLLBACK')
+            return fail(res, 409, 'Sender has insufficient available balance for pending transfers.')
+        }
         await entry(db, location, t.FromAccountId, -Number(t.Amount), 'TRANSFER', req.authUser.id, `Transfer #${t.ID}`, { transferId: t.ID }); await entry(db, location, t.ToAccountId, t.Amount, 'TRANSFER', req.authUser.id, `Transfer #${t.ID}`, { transferId: t.ID }); await db.query(`UPDATE "LocationCashTransfers" SET "Status"='Accepted',"AcceptedBy"=$2,"AcceptedAt"=NOW() WHERE "ID"=$1`, [t.ID, req.authUser.id]); await db.query('COMMIT'); return ok(res, null, 'Cash receipt confirmed.')
     } catch (e) { try { await db.query('ROLLBACK') } catch { }; console.error('Cash transfer accept:', e); return fail(res, 500, 'Unable to confirm transfer.') } finally { db.release() }
 })

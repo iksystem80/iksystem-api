@@ -3,8 +3,70 @@ const router = express.Router()
 
 const { pool } = require('../db')
 const { requireModuleAccess } = require('../utils/moduleAccess')
+const { authenticate } = require('../middleware/auth')
 const { isAuditVerificationEnabled } = require('../utils/auditVerification')
 const { emitAppRefresh } = require('../utils/realtime')
+
+// Employee self-service clock-out and status resolve the signed-in user
+// directly and do not accept a locationid. All other routes are scoped to
+// a location and must validate that scope on the server.
+router.use(authenticate, async (req, res, next) => {
+    if (req.path === '/clockout' || req.path.startsWith('/status/')) {
+        return next()
+    }
+
+    const suppliedLocation = req.method === 'GET'
+        ? req.query.locationid
+        : (req.body?.locationid ?? req.query.locationid)
+    const locationId = Number(suppliedLocation)
+
+    if (!Number.isSafeInteger(locationId) || locationId <= 0) {
+        return res.status(400).json({ success: false, code: 40000,
+            message: 'A valid locationid is required.' })
+    }
+
+    try {
+        const location = await pool.query(`
+            SELECT "CompanyId" FROM "Locations" WHERE "ID" = $1 LIMIT 1
+        `, [locationId])
+        if (!location.rowCount) {
+            return res.status(404).json({ success: false, code: 40400,
+                message: 'Location not found.' })
+        }
+
+        const role = String(req.authUser?.roleName || '').trim().toLowerCase()
+        if (role !== 'system admin') {
+            if (Number(location.rows[0].CompanyId) !== Number(req.authUser?.companyId)) {
+                return res.status(403).json({ success: false, code: 40300,
+                    message: 'Location access denied.' })
+            }
+
+            if (role !== 'owner') {
+                const allowed = await pool.query(`
+                    SELECT 1 FROM "Users" u
+                    WHERE u."ID" = $1
+                      AND (u."LocationId" = $2
+                           OR ($3 = 'admin' AND EXISTS (
+                               SELECT 1 FROM "UserLocationAccess" ula
+                               WHERE ula."UserId" = u."ID"
+                                 AND ula."LocationId" = $2
+                           )))
+                    LIMIT 1
+                `, [req.authUser.id, locationId, role])
+                if (!allowed.rowCount) {
+                    return res.status(403).json({ success: false, code: 40300,
+                        message: 'Location access denied.' })
+                }
+            }
+        }
+
+        return next()
+    } catch (error) {
+        console.error('Employee session location authorization:', error)
+        return res.status(500).json({ success: false, code: 50000,
+            message: 'Unable to verify location access.' })
+    }
+})
 
 // ============================================================
 // CLOCK IN
@@ -15,11 +77,21 @@ router.post(
     '/clockin',
     requireModuleAccess(["clock", "transaction.employee"]),
     async (req, res) => {
+        const client = await pool.connect()
         try {
             const {
                 userid,
                 locationid
             } = req.body
+
+            // Self-service clock-in must never operate on a supplied other user ID.
+            if (Number(req.authUser?.id) !== Number(userid)) {
+                return res.status(403).json({
+                    success: false,
+                    code: 40300,
+                    message: 'You may only clock in your own session.'
+                })
+            }
 
             if (!userid || !locationid) {
                 return res.status(400).json({
@@ -65,13 +137,23 @@ router.post(
                 })
             }
 
+            // Display numbering is independent per location. Keep ID as the only
+            // internal key. Serialize creation at each location to avoid duplicates.
+            await client.query('BEGIN')
+            await client.query('SELECT pg_advisory_xact_lock(917201,$1::integer)', [Number(locationid)])
+            const nextNumber = await client.query(`
+                SELECT COALESCE(MAX("SessionNumber"),0)+1 AS next_number
+                FROM "EmployeeSession" WHERE "LocationId"=$1`, [Number(locationid)])
+            const sessionNumber = nextNumber.rows[0].next_number
+
             const result =
-                await pool.query(
+                await client.query(
                     `
                     INSERT INTO "EmployeeSession"
                     (
                         "UserId",
                         "LocationId",
+                        "SessionNumber",
                         "ClockIn",
                         "TotalWorkingHours",
                         "IsPaid"
@@ -80,12 +162,14 @@ router.post(
                     (
                         $1,
                         $2,
+                        $3,
                         NOW(),
                         0,
                         false
                     )
                     RETURNING
                         "ID" AS "id",
+                        "SessionNumber" AS "sessionNumber",
                         "UserId" AS "userId",
                         "LocationId" AS "locationId",
                         "ClockIn" AS "clockIn",
@@ -96,9 +180,11 @@ router.post(
                     `,
                     [
                         userid,
-                        locationid
+                        locationid,
+                        sessionNumber
                     ]
                 )
+            await client.query('COMMIT')
 
             // Clock-in INSERT is complete at this point. Notify open Employee Session
             // views at this location so Online/Offline status updates immediately.
@@ -122,6 +208,7 @@ router.post(
             })
 
         } catch (error) {
+            try { await client.query('ROLLBACK') } catch (_) { }
             console.error(
                 'Clock-in error:',
                 error
@@ -144,6 +231,8 @@ router.post(
                 message:
                     'Unable to clock in.'
             })
+        } finally {
+            client.release()
         }
     }
 )
@@ -370,11 +459,20 @@ router.get(
                 })
             }
 
+            if (Number(req.authUser?.id) !== userid) {
+                return res.status(403).json({
+                    success: false,
+                    code: 40300,
+                    message: 'You may only view your own clock status.'
+                })
+            }
+
             const result =
                 await pool.query(
                     `
                     SELECT
                         es."ID" AS "id",
+                        es."SessionNumber" AS "sessionNumber",
                         es."UserId" AS "userId",
                         es."LocationId" AS "locationId",
                         es."ClockIn" AS "clockIn",
@@ -486,11 +584,22 @@ router.get(
                 })
             }
 
+            // This endpoint is for the signed-in employee's session history.
+            // Management reports use the separate /reports routes.
+            if (Number(req.authUser?.id) !== userid) {
+                return res.status(403).json({
+                    success: false,
+                    code: 40300,
+                    message: 'You may only view your own session history.'
+                })
+            }
+
             const result =
                 await pool.query(
                     `
                     SELECT
                         es."ID" AS "id",
+                        es."SessionNumber" AS "sessionNumber",
 
                         es."ClockIn"
                             AS "clockIn",
@@ -613,6 +722,9 @@ router.get('/reports/employees', requireModuleAccess(["operations.employee-sessi
     try {
         const locationid = Number(req.query.locationid)
         const dates = reportDateFilter(req.query)
+        const reconciliation = String(req.query.reconciliation || 'unreconciled').toLowerCase()
+        if (!['unreconciled', 'reconciled', 'all'].includes(reconciliation))
+            return res.status(400).json({ success: false, code: 40000, message: 'Invalid reconciliation filter.' })
         if (!Number.isSafeInteger(locationid) || locationid <= 0 || !dates)
             return res.status(400).json({ success: false, code: 40000, message: 'Valid location and date range are required.' })
         const result = await pool.query(`
@@ -621,6 +733,9 @@ router.get('/reports/employees', requireModuleAccess(["operations.employee-sessi
                 WHERE es."LocationId" = $1
                   AND ($2::date IS NULL OR (es."ClockIn" AT TIME ZONE 'America/Chicago')::date >= $2::date)
                   AND ($3::date IS NULL OR (es."ClockIn" AT TIME ZONE 'America/Chicago')::date <= $3::date)
+                  AND ($4::text = 'all'
+                       OR ($4::text = 'reconciled' AND es."ReadingSessionId" IS NOT NULL)
+                       OR ($4::text = 'unreconciled' AND es."ReadingSessionId" IS NULL))
             ), session_totals AS (
                 SELECT es."ID", es."UserId", es."ClockIn", es."ClockOut",
                        es."ReadingSessionId", es."TotalWorkingHours",
@@ -677,7 +792,7 @@ router.get('/reports/employees', requireModuleAccess(["operations.employee-sessi
             WHERE u."LocationId" = $1 AND COALESCE(u."IsActive",true) = true
             GROUP BY u."ID", u."Name", u."Username", u."Avatar", u."JobTitle"
             ORDER BY COALESCE(NULLIF(BTRIM(u."Name"), ''), u."Username", 'Employee') ASC
-        `, [locationid, dates.startDate, dates.endDate])
+        `, [locationid, dates.startDate, dates.endDate, reconciliation])
         return res.json({ success: true, code: 20000, message: 'Employee session summary retrieved successfully.', data: result.rows })
     } catch (error) {
         console.error('Employee session summary error:', error)
@@ -698,6 +813,9 @@ router.get(
             const userid = Number(req.params.userid)
             const locationid = Number(req.query.locationid)
             const dates = reportDateFilter(req.query)
+            const reconciliation = String(req.query.reconciliation || 'unreconciled').toLowerCase()
+            if (!['unreconciled', 'reconciled', 'all'].includes(reconciliation))
+                return res.status(400).json({ success: false, code: 40000, message: 'Invalid reconciliation filter.' })
 
             if (!userid || !locationid || !dates) {
                 return res.status(400).json({
@@ -736,6 +854,7 @@ router.get(
                 `
                 SELECT
                     es."ID" AS "id",
+                        es."SessionNumber" AS "sessionNumber",
                     es."ClockIn" AS "clockIn",
                     es."ClockOut" AS "clockOut",
                     es."TotalWorkingHours" AS "totalWorkingHours",
@@ -805,6 +924,9 @@ router.get(
                     AND es."LocationId" = $2
                     AND ($3::date IS NULL OR (es."ClockIn" AT TIME ZONE 'America/Chicago')::date >= $3::date)
                     AND ($4::date IS NULL OR (es."ClockIn" AT TIME ZONE 'America/Chicago')::date <= $4::date)
+                    AND ($5::text = 'all'
+                         OR ($5::text = 'reconciled' AND es."ReadingSessionId" IS NOT NULL)
+                         OR ($5::text = 'unreconciled' AND es."ReadingSessionId" IS NULL))
                 GROUP BY
                     es."ID",
                     es."ClockIn",
@@ -814,7 +936,7 @@ router.get(
                     es."ReadingSessionId", c.cash_expenses, r.raffle_expenses, tk.ticket_expenses, bn.bonus_expenses, lb.lucky_bird_expenses
                 ORDER BY es."ClockIn" DESC
                 `,
-                [userid, locationid, dates.startDate, dates.endDate]
+                [userid, locationid, dates.startDate, dates.endDate, reconciliation]
             )
 
             return res.status(200).json({
@@ -863,6 +985,7 @@ router.get(
                 `
                 SELECT
                     es."ID" AS "id",
+                        es."SessionNumber" AS "sessionNumber",
                     es."UserId" AS "userId",
                     es."LocationId" AS "locationId",
                     es."ClockIn" AS "clockIn",
@@ -1001,6 +1124,7 @@ router.get(
                 `
                 SELECT
                     es."ID" AS "id",
+                        es."SessionNumber" AS "sessionNumber",
                     es."UserId" AS "userId",
                     es."LocationId" AS "locationId",
                     es."ClockIn" AS "clockIn",
