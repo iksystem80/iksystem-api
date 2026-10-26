@@ -2393,6 +2393,7 @@ async function loadAdminCustodyHistory(locationId, adminUserId) {
             const funding = group.kind === 'EMPLOYEE_SUPPORT' && primary.amountCents < 0
             const isCollection = group.kind === 'MACHINE_COLLECTION'
             const isClosing = group.kind === 'SHIFT_CLOSING' || group.kind === 'EMPLOYEE_CASH_TAKEN'
+            const handover = isClosing ? group.entries.filter(e => e.kind === 'EMPLOYEE_CASH_TAKEN').reduce((n,e)=>n+e.amountCents,0) : 0
             const collection = group.entries.filter(e => e.kind === 'MACHINE_COLLECTION')
                 .reduce((n,e) => n + e.amountCents,0)
             const matchSession = String(primary.notes || '').match(/session\s*#(\d+)/i)
@@ -2409,12 +2410,13 @@ async function loadAdminCustodyHistory(locationId, adminUserId) {
                 type, status: 'Posted', notes: primary.notes,
                 sessionId: matchSession ? Number(matchSession[1]) : null,
                 // Initial capital is the seed balance displayed in the opening column.
-                opening: (capital ? balanceCents : before + (isClosing ? group.entries.filter(e => e.kind === 'EMPLOYEE_CASH_TAKEN').reduce((n,e)=>n+e.amountCents,0) : 0)) / 100,
+                opening: (capital ? balanceCents : before) / 100,
+                handover: handover / 100,
                 collection: collection / 100,
                 calculatedCollection: group.entries.filter(e => e.kind === 'MACHINE_COLLECTION' && e.calculatedPosting != null)
                     .reduce((n,e) => n + cents(e.calculatedPosting),0) / 100,
                 funding: funding ? primary.amountCents / 100 : 0,
-                otherMovement: capital ? 0 : (delta - collection - (funding ? primary.amountCents : 0)) / 100,
+                otherMovement: capital ? 0 : (delta - collection - handover - (funding ? primary.amountCents : 0)) / 100,
                 closing: balanceCents / 100,
                 amount: primary.amount,
                 fundingId: primary.fundingId,
