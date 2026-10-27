@@ -1561,7 +1561,7 @@ router.post('/reading-profit/:sessionId', requireModuleAccess(["transaction.admi
              AND t."LocationId" = es."LocationId"
             JOIN "CreditTypes" ct
               ON ct."ID" = t."CreditTypeId"
-             AND ct."LocationId" = t."LocationId"
+             AND (ct."LocationId" = t."LocationId" OR ct."LocationId" IS NULL)
             WHERE es."ReadingSessionId" = $1
               AND es."LocationId" = $2
               AND es."ClockOut" IS NOT NULL

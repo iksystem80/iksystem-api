@@ -9,6 +9,12 @@ const { optimizeImageUpload } = require('../utils/optimizeImageUpload')
 const { validateImageUpload } = require('../utils/validateImageUpload')
 const { uploadBuffer } = require('../utils/imageStorage')
 const { authenticate } = require('../middleware/auth')
+const {
+    notifySessionReplaced,
+    findSessionReview,
+    forgetSessionReview,
+    notifySessionRevoked
+} = require('../utils/realtime')
 
 // ============================================================
 // HELPERS
@@ -132,6 +138,7 @@ router.post('/login', async (req, res) => {
 
     const resultResponse = (status, data) => ({ status, data })
     let inTransaction = false
+    let replacedSession = null
     try {
         await client.query('BEGIN')
         inTransaction = true
@@ -362,6 +369,10 @@ router.post('/login', async (req, res) => {
                 WHERE "ID" = $2
             `, [sessionToken, user.ID])
 
+            if (typeof user.token === 'string' && user.token) {
+                replacedSession = { userId: user.ID, oldToken: user.token, newToken: sessionToken }
+            }
+
             return resultResponse(200, {
                 success: true, message: 'Login successful!', code: 20000,
                 token: sessionToken, userid: user.ID,
@@ -375,6 +386,18 @@ router.post('/login', async (req, res) => {
         const response = await processLogin()
         await client.query('COMMIT')
         inTransaction = false
+        if (response.status === 200 && replacedSession) {
+            // Emit only AFTER commit so the previous session is already invalid.
+            try {
+                notifySessionReplaced(
+                    replacedSession.userId,
+                    replacedSession.oldToken,
+                    replacedSession.newToken
+                )
+            } catch (notificationError) {
+                console.error('Login replacement notification error:', notificationError)
+            }
+        }
         return res.status(response.status).json(response.data)
     } catch (error) {
         if (inTransaction) await client.query('ROLLBACK').catch(() => {})
@@ -382,6 +405,54 @@ router.post('/login', async (req, res) => {
         return res.status(500).json({ success: false, code: 50000, message: 'Unable to sign in.' })
     } finally {
         client.release()
+    }
+})
+
+// A revoked old token cannot use normal authenticated routes. This endpoint
+// accepts ONLY a valid one-time takeover proof plus that old token; it can
+// revoke ONLY the particular newer session which replaced it.
+router.post('/report-unrecognized-login', async (req, res) => {
+    const oldToken = req.headers['x-token']
+    const challenge = req.body?.challenge
+    const review = findSessionReview(challenge, oldToken)
+    if (!review) {
+        return res.status(410).json({
+            success: false, code: 41000,
+            message: 'Security confirmation expired or is invalid. Please secure your account.'
+        })
+    }
+
+    try {
+        const result = await pool.query(`
+            UPDATE "Users"
+            SET "token" = NULL,
+                "TokenExpiresAt" = NULL,
+                "DateUpdated" = NOW()
+            WHERE "ID" = $1 AND "token" = $2
+            RETURNING "ID"
+        `, [review.userId, review.expectedNewToken])
+
+        // The next login might already have replaced the reviewed session.
+        // Never revoke an unrelated, later token with a stale confirmation.
+        forgetSessionReview(challenge)
+        if (!result.rowCount) {
+            return res.status(409).json({
+                success: false, code: 40900,
+                message: 'That session is no longer current. Please secure your account.'
+            })
+        }
+
+        notifySessionRevoked(review.userId, review.expectedNewToken)
+        return res.status(200).json({
+            success: true, code: 20000,
+            message: 'The unrecognized session has been revoked.'
+        })
+    } catch (error) {
+        console.error('Unrecognized login revocation error:', error)
+        return res.status(500).json({
+            success: false, code: 50000,
+            message: 'Unable to revoke the session. Please contact an administrator.'
+        })
     }
 })
 
