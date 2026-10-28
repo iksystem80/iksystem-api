@@ -1976,6 +1976,93 @@ function weeklyReportNumber(value) {
     return Number.isFinite(number) ? number : 0
 }
 
+// Independent audit endpoint, reusable outside Weekly Report.
+// sessionid is ReadingSessions.ID (never the display SessionNumber).
+router.get(
+    '/weeklyreport/match-audit',
+    requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
+    async (req, res) => {
+        try {
+            const locationId = Number(req.query.locationid)
+            const sessionId = Number(req.query.sessionid)
+            if (!Number.isSafeInteger(locationId) || locationId <= 0 ||
+                !Number.isSafeInteger(sessionId) || sessionId <= 0) {
+                return errorResponse(res, 400, 'Valid location and reading session are required.', 40000)
+            }
+
+            const sessionResult = await pool.query(`
+                SELECT rs."ID" AS id, rs."SessionNumber" AS "sessionNumber",
+                       rs."StartedAt" AS "startedAt", rs."EndedAt" AS "endedAt"
+                FROM "ReadingSessions" rs
+                WHERE rs."ID"=$1 AND rs."LocationId"=$2
+                  AND rs."Status" IN (2,3) AND COALESCE(rs."isDeleted",false)=false
+                LIMIT 1
+            `, [sessionId, locationId])
+            if (!sessionResult.rowCount) {
+                return errorResponse(res, 404, 'Reading session not found for this location.', 40400)
+            }
+
+            // Aggregate readings separately so a machine's IN is never multiplied
+            // by the number of customer matches or employee shifts.
+            const machinesResult = await pool.query(`
+                WITH reading AS (
+                    SELECT mr."MachineId" AS machine_id,
+                           SUM(COALESCE(mr."CurrentIn",0)-COALESCE(mr."PreviousIn",0)) AS daily_in
+                    FROM "MachineReadings" mr
+                    WHERE mr."SessionId"=$1 AND mr."ReadingType" <> 'INITIAL'
+                    GROUP BY mr."MachineId"
+                ), matched AS (
+                    SELECT DISTINCT cm."MachineId" AS machine_id
+                    FROM "CustomerMatch" cm
+                    JOIN "EmployeeSession" es ON es."ID"=cm."EmployeeSessionId"
+                    WHERE es."ReadingSessionId"=$1 AND es."LocationId"=$2
+                      AND es."ClockOut" IS NOT NULL
+                      AND cm."LocationId"=$2
+                )
+                SELECT m."ID" AS id, m."MachineNumber" AS "machineNumber",
+                       COALESCE(NULLIF(BTRIM(mt."TypeName"),''),'Unassigned') AS "machineType",
+                       COALESCE(r.daily_in,0)::numeric(14,2) AS "actualIn",
+                       (r.machine_id IS NOT NULL) AS "hasReading"
+                FROM (SELECT machine_id FROM reading UNION SELECT machine_id FROM matched) ids
+                JOIN "Machines" m ON m."ID"=ids.machine_id AND m.locationid=$2
+                LEFT JOIN "MachineTypes" mt ON mt."ID"=m."MachineTypeId"
+                LEFT JOIN reading r ON r.machine_id=m."ID"
+                ORDER BY m."MachineNumber",m."ID"
+            `, [sessionId, locationId])
+
+            const matchesResult = await pool.query(`
+                SELECT cm."ID" AS id, cm."MachineId" AS "machineId",
+                       cm."CustomerId" AS "customerId",
+                       COALESCE(NULLIF(BTRIM(CONCAT_WS(' ',c."Firstname",c."Lastname")),''),
+                           'Customer #' || cm."CustomerId"::text) AS "customerName",
+                       es."UserId" AS "employeeId",
+                       COALESCE(NULLIF(BTRIM(u."Name"),''),u."Username",'Employee') AS "employeeName",
+                       cm."Points"::numeric(14,2) AS amount,
+                       COALESCE(cm."IsExtraMatch",false) AS "isExtraMatch",
+                       TO_CHAR(cm."DateAssign",'YYYY-MM-DD"T"HH24:MI:SS') AS "assignedAt"
+                FROM "CustomerMatch" cm
+                JOIN "EmployeeSession" es ON es."ID"=cm."EmployeeSessionId"
+                  AND es."LocationId"=$2 AND es."ReadingSessionId"=$1
+                  AND es."ClockOut" IS NOT NULL
+                JOIN "Users" u ON u."ID"=es."UserId"
+                LEFT JOIN "Customer" c ON c."ID"=cm."CustomerId"
+                JOIN "Machines" m ON m."ID"=cm."MachineId" AND m.locationid=$2
+                WHERE cm."LocationId"=$2
+                ORDER BY cm."DateAssign",cm."ID"
+            `, [sessionId, locationId])
+
+            return success(res, {
+                session: sessionResult.rows[0],
+                machines: machinesResult.rows,
+                matches: matchesResult.rows
+            }, 'Match audit loaded successfully.')
+        } catch (err) {
+            console.error('Reading match audit error:', err)
+            return errorResponse(res, 500, 'Unable to load match audit.')
+        }
+    }
+)
+
 router.get(
     '/weeklyreport/week',
     requireModuleAccess(["reading.record", "reading.reports", "reports.weekly"]),
@@ -2004,6 +2091,7 @@ router.get(
                         JSONB_AGG(
                             JSONB_BUILD_OBJECT(
                                 'id', sessions.id,
+                                'sessionNumber', sessions."sessionNumber",
                                 'startedAt', sessions.startedat,
                                 'endedAt', sessions.endedat,
                                 'status', sessions.status,
