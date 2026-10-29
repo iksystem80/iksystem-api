@@ -689,7 +689,8 @@ router.post(
             }
 
             // --------------------------------------------------------
-            // Prevent same machine twice inside one session
+            // Find the current session reading, if any. The session row lock
+            // above serializes saves so a replacement cannot create duplicates.
             // --------------------------------------------------------
 
             const duplicate =
@@ -715,17 +716,6 @@ router.post(
                         machineid
                     ]
                 )
-
-            if (duplicate.rows.length) {
-                await client.query('ROLLBACK')
-
-                return errorResponse(
-                    res,
-                    409,
-                    'A reading for this machine already exists in this session. Delete it before taking another reading.',
-                    40900
-                )
-            }
 
             // --------------------------------------------------------
             // Resolve canonical Previous IN / OUT
@@ -824,11 +814,27 @@ router.post(
             }
 
             // --------------------------------------------------------
-            // Insert reading
+            // Save newest reading. Retakes overwrite the existing row, keeping
+            // its ID and the same confirmed-reading baseline.
             // --------------------------------------------------------
 
-            const result =
-                await client.query(
+            const result = duplicate.rows.length
+                ? await client.query(
+                    `
+                    UPDATE "MachineReadings"
+                    SET "ReadingType" = 'Manual',
+                        "PreviousIn" = $2,
+                        "PreviousOut" = $3,
+                        "CurrentIn" = $4,
+                        "CurrentOut" = $5,
+                        "ReadingAt" = NOW()
+                    WHERE "ID" = $1 AND "SessionId" = $6 AND "MachineId" = $7
+                    RETURNING "ID" AS id
+                    `,
+                    [duplicate.rows[0].ID, canonicalPreviousIn, canonicalPreviousOut,
+                        readingin, readingout, sessionid, machineid]
+                )
+                : await client.query(
                     `
                     INSERT INTO
                         "MachineReadings"
@@ -872,7 +878,7 @@ router.post(
             return res.status(200).json({
                 success: true,
                 code: 20000,
-                message: 'Reading saved successfully.',
+                message: duplicate.rows.length ? 'Reading replaced successfully.' : 'Reading saved successfully.',
                 ReadingId: result.rows[0].id,
                 data: result.rows[0]
             })

@@ -386,8 +386,8 @@ router.post(
 )
 
 // ============================================================
-// AUTHORIZED BYPASS + ACTIVATE CUSTOMER
-// Permission: customers.verification.bypass
+// BYPASS + ACTIVATE CUSTOMER
+// Any user with customers module access and access to the customer's location.
 // ============================================================
 
 router.post(
@@ -395,10 +395,6 @@ router.post(
     requireModuleAccess('customers'),
     async (req, res) => {
         try {
-            const role = String(req.authUser?.roleName || '').trim().toLowerCase()
-            if (!['system admin', 'owner', 'admin'].includes(role)) {
-                return res.status(403).json({ success: false, code: 40300, message: 'Owner/Admin approval is required to bypass phone verification.' })
-            }
             const customerId =
                 Number(req.body.customerId)
 

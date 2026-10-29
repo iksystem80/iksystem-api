@@ -1,5 +1,6 @@
 const express = require('express')
 const multer = require('multer')
+const AdmZip = require('adm-zip')
 const { validateImageUpload } = require('../utils/validateImageUpload')
 const path = require('path')
 const sharp = require('sharp')
@@ -104,6 +105,104 @@ module.exports = function (io) {
     setSocketIO(io)
     const router = express.Router()
 
+    // Bulk import: JSON + ZIP are parsed in memory; no ZIP entry is ever extracted
+    // onto the server filesystem. Keep these limits independent of photo uploads.
+    const bulkUpload = multer({
+        storage: multer.memoryStorage(),
+        limits: { fileSize: 100 * 1024 * 1024, files: 2 }
+    }).fields([{ name: 'customers', maxCount: 1 }, { name: 'photos', maxCount: 1 }])
+
+    router.post('/importcustomers', requireModuleAccess('customers'), bulkUpload,
+        requireCustomerUploadLocation, async (req, res) => {
+            const rejected = []
+            let imported = 0
+            try {
+                const jsonFile = req.files?.customers?.[0]
+                const zipFile = req.files?.photos?.[0]
+                if (!jsonFile || !zipFile || jsonFile.size > 2 * 1024 * 1024) {
+                    return res.status(400).json({ success: false, message: 'Upload customers.json (max 2 MB) and photos.zip.' })
+                }
+                let customers
+                try { customers = JSON.parse(jsonFile.buffer.toString('utf8')) } catch (_) {
+                    return res.status(400).json({ success: false, message: 'Invalid customers JSON.' })
+                }
+                if (!Array.isArray(customers) || customers.length < 1 || customers.length > 500) {
+                    return res.status(400).json({ success: false, message: 'JSON must contain 1 to 500 customers.' })
+                }
+                const locationId = Number(req.body.locationid)
+                const location = await pool.query('SELECT "AllowFaceCheckin" FROM "Locations" WHERE "ID"=$1', [locationId])
+                if (!location.rowCount) return res.status(404).json({ success: false, message: 'Location not found.' })
+                const allowFaceCheckin = location.rows[0].AllowFaceCheckin !== false
+
+                const zip = new AdmZip(zipFile.buffer)
+                const imageEntries = zip.getEntries().filter(entry => !entry.isDirectory &&
+                    /\.(jpe?g|png|webp)$/i.test(entry.entryName))
+                if (imageEntries.length > 1000) {
+                    return res.status(400).json({ success: false, message: 'Too many images in ZIP.' })
+                }
+                const seen = new Set()
+                const photoEntries = new Map()
+                for (const entry of imageEntries) {
+                    const basename = path.posix.basename(entry.entryName.replace(/\\/g, '/'))
+                    if (!photoEntries.has(basename)) photoEntries.set(basename, entry)
+                    else photoEntries.set(basename, null) // ambiguous photo name
+                }
+
+                for (let i = 0; i < customers.length; i++) {
+                    const item = customers[i] || {}
+                    const first = String(item.first_name || item.firstname || '').trim()
+                    const last = String(item.last_name || item.lastname || '').trim()
+                    const phone = String(item.phone || '').replace(/\D/g, '')
+                    const identity = { row: item.row || i + 1, first_name: first, last_name: last, phone }
+                    const skip = reason => rejected.push({ ...identity, reason })
+                    try {
+                        if (!first || !last || first.length > 150 || last.length > 150) {
+                            skip('Missing or invalid first/last name'); continue
+                        }
+                        if (phone.length !== 10) { skip('Phone must contain exactly 10 digits'); continue }
+                        if (seen.has(phone)) { skip('Duplicate phone within uploaded JSON'); continue }
+                        seen.add(phone)
+                        const exists = await pool.query('SELECT 1 FROM "Customer" WHERE "locationid"=$1 AND "Phone"=$2 LIMIT 1', [locationId, phone])
+                        if (exists.rowCount) { skip('Phone already registered at this location'); continue }
+                        const photoName = path.posix.basename(String(item.photo_file || '').replace(/\\/g, '/'))
+                        if (!photoName) { skip('Photo filename missing from JSON'); continue }
+                        const photo = photoEntries.get(photoName)
+                        if (!photo) { skip('Photo missing from ZIP or filename is ambiguous'); continue }
+                        if (photo.header.size > 5 * 1024 * 1024 || photo.header.size <= 0) {
+                            skip('Photo exceeds 5 MB or is empty'); continue
+                        }
+                        const buffer = photo.getData()
+                        await validateCustomerCloudImage(buffer)
+                        const embedding = allowFaceCheckin ? await createFaceEmbedding(buffer) : null
+                        const cloud = await uploadToCloudinary(buffer, 'customers')
+                        const saved = await pool.query(`
+                            INSERT INTO "Customer" ("Firstname", "Lastname", "DOB", "avatar", "Phone", "DateCreated",
+                                "locationid", "IsActive", "PhoneVerified", "PhoneVerifiedAt", "VerificationMethod",
+                                "Embedding", "CreatedBy", "IsVIP", "IsBlacklist")
+                            VALUES ($1, $2, NULL, $3, $4, NOW(), $5, true, false, NULL, NULL, $6, $7, false, false)
+                            ON CONFLICT DO NOTHING
+                            RETURNING "ID"`, [first, last, cloud.secure_url, phone, locationId,
+                            embedding === null ? null : pgvector.toSql(embedding), req.authUser.id])
+                        if (saved.rowCount) imported++
+                        else skip('Phone already registered at this location')
+                    } catch (error) {
+                        if (error.code === '23505') skip('Phone already registered at this location')
+                        else if (error instanceof FaceDetectionError) skip('Face verification required at this location: ' + error.message)
+                        else {
+                            console.error('Customer import failed at row', i + 1, error)
+                            skip(error.message === 'Invalid customer photo.' ? 'Invalid photo format or size' : 'Unable to save customer or photo')
+                        }
+                    }
+                }
+                return res.json({ success: true, imported, notSaved: rejected.length, rejected,
+                    total: customers.length, message: `Imported ${imported} of ${customers.length} customers.` })
+            } catch (error) {
+                console.error('Bulk customer import:', error)
+                return res.status(400).json({ success: false, imported, rejected,
+                    message: 'Import could not be completed. Check the JSON and photo ZIP.' })
+            }
+        })
+
     // ============================================================
     // Configure file uploads
     // ============================================================
@@ -182,10 +281,25 @@ module.exports = function (io) {
                     })
                 }
 
-                const embedding =
-                    await createFaceEmbedding(
-                        req.file.buffer
-                    )
+                // Face enrollment is optional for locations that disable face check-in.
+                // Keep the existing strict face validation wherever it is enabled.
+                const faceSettings = await pool.query(
+                    'SELECT "AllowFaceCheckin" FROM "Locations" WHERE "ID" = $1 LIMIT 1',
+                    [locationId]
+                )
+
+                if (faceSettings.rowCount === 0) {
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Location not found.',
+                        code: 40400
+                    })
+                }
+
+                const allowFaceCheckin = faceSettings.rows[0].AllowFaceCheckin !== false
+                const embedding = allowFaceCheckin
+                    ? await createFaceEmbedding(req.file.buffer)
+                    : null
 
                 const result =
                     await uploadToCloudinary(
@@ -223,7 +337,7 @@ module.exports = function (io) {
                             $5,
                             NOW(),
                             $6,
-                            false,
+                            true,
                             false,
                             NULL,
                             NULL,
@@ -246,7 +360,7 @@ module.exports = function (io) {
                             result.secure_url,
                             phone,
                             locationId,
-                            pgvector.toSql(embedding),
+                            embedding === null ? null : pgvector.toSql(embedding),
                             req.authUser.id,
                         ]
                     )
@@ -262,7 +376,7 @@ module.exports = function (io) {
                     return res.status(201).json({
                         success: true,
                         message:
-                            'Customer saved. Phone verification is required before activation.',
+                            'Customer saved as active. Phone remains unverified.',
                         code: 20000,
                         data: dbResult.rows[0],
                     })
@@ -836,22 +950,6 @@ module.exports = function (io) {
                         })
                     }
 
-                    const verificationBypassed =
-                        String(customer.verificationmethod || '')
-                            .toLowerCase() === 'bypass'
-
-                    if (
-                        customer.phoneverified !== true &&
-                        !verificationBypassed
-                    ) {
-                        return res.status(403).json({
-                            success: false,
-                            matched: true,
-                            message: 'Customer verification is required before check-in.',
-                            code: 40300,
-                        })
-                    }
-
                     const imgresult =
                         await uploadToCloudinary(
                             req.file.buffer,
@@ -940,21 +1038,6 @@ module.exports = function (io) {
                         })
                     }
 
-                    const verificationBypassed =
-                        String(customer.verificationmethod || '')
-                            .toLowerCase() === 'bypass'
-
-                    if (
-                        customer.phoneverified !== true &&
-                        !verificationBypassed
-                    ) {
-                        return res.status(403).json({
-                            success: false,
-                            matched: true,
-                            message: 'Customer verification is required before check-in.',
-                            code: 40300,
-                        })
-                    }
                 }
 
                 // ====================================================
@@ -1767,6 +1850,8 @@ module.exports = function (io) {
                     customerid,
                     locationid,
                     points,
+                    phone,
+                    verificationstatus,
                     isactive,
                     isvip,
                     isblacklist,
@@ -1781,6 +1866,9 @@ module.exports = function (io) {
 
                 const nextPoints =
                     Number(points)
+
+                const nextPhone = String(phone ?? '').replace(/\D/g, '')
+                const requestedVerificationStatus = String(verificationstatus ?? '').trim().toLowerCase()
 
                 const nextIsActive =
                     isactive === true
@@ -1802,11 +1890,13 @@ module.exports = function (io) {
                     !Number.isInteger(actingUserId) ||
                     actingUserId <= 0 ||
                     !Number.isFinite(nextPoints) ||
-                    nextPoints < 0
+                    nextPoints < 0 ||
+                    nextPhone.length !== 10 ||
+                    !['verified', 'unverified', 'bypass'].includes(requestedVerificationStatus)
                 ) {
                     return res.status(400).json({
                         success: false,
-                        message: 'Valid customer, location, user and point balance are required.',
+                        message: 'Valid customer, location, points, phone number and verification status are required.',
                         code: 40000
                     })
                 }
@@ -1822,6 +1912,7 @@ module.exports = function (io) {
                             "IsActive",
                             "IsVIP",
                             "IsBlacklist",
+                            "Phone",
                             "PhoneVerified",
                             "VerificationMethod",
                             "PrivilegedMatchRule"
@@ -1845,7 +1936,30 @@ module.exports = function (io) {
                 const currentCustomer =
                     customerResult.rows[0]
 
+                const phoneChanged = String(currentCustomer.Phone ?? '').replace(/\D/g, '') !== nextPhone
+                // A new phone number must never inherit verification of the old number.
+                const nextVerificationStatus = phoneChanged ? 'unverified' : requestedVerificationStatus
+                const currentVerificationStatus = currentCustomer.PhoneVerified === true
+                    ? 'verified'
+                    : String(currentCustomer.VerificationMethod ?? '').trim().toLowerCase() === 'bypass'
+                        ? 'bypass'
+                        : 'unverified'
+
                 const changes = [
+                    {
+                        changed: phoneChanged,
+                        type: 'PHONE_NUMBER',
+                        oldValue: currentCustomer.Phone,
+                        newValue: nextPhone,
+                        description: `User ${actingUserId} changed customer phone number`
+                    },
+                    {
+                        changed: currentVerificationStatus !== nextVerificationStatus,
+                        type: 'PHONE_VERIFICATION',
+                        oldValue: currentVerificationStatus,
+                        newValue: nextVerificationStatus,
+                        description: `User ${actingUserId} changed phone verification to ${nextVerificationStatus}`
+                    },
                     {
                         changed:
                             Number(currentCustomer.Points) !== nextPoints,
@@ -1939,7 +2053,11 @@ module.exports = function (io) {
                             "PrivilegedMatchRule" = $2,
                             "IsActive" = $3,
                             "IsVIP" = $4,
-                            "IsBlacklist" = $5
+                            "IsBlacklist" = $5,
+                            "Phone" = $8,
+                            "PhoneVerified" = $9,
+                            "PhoneVerifiedAt" = CASE WHEN $9 THEN COALESCE("PhoneVerifiedAt", NOW()) ELSE NULL END,
+                            "VerificationMethod" = $10
                         WHERE "ID" = $6 AND "locationid" = $7
                         RETURNING
                             "ID" AS id,
@@ -1948,6 +2066,7 @@ module.exports = function (io) {
                             "IsActive" AS isactive,
                             "IsVIP" AS isvip,
                             "IsBlacklist" AS isblacklist,
+                            "Phone" AS phone,
                             "PhoneVerified" AS phoneverified,
                             "VerificationMethod" AS verificationmethod
                         `,
@@ -1958,7 +2077,10 @@ module.exports = function (io) {
                             nextIsVip,
                             nextIsBlacklist,
                             customerId,
-                            locationId
+                            locationId,
+                            nextPhone,
+                            nextVerificationStatus === 'verified',
+                            nextVerificationStatus === 'verified' ? 'manual' : nextVerificationStatus === 'bypass' ? 'bypass' : null
                         ]
                     )
 
@@ -1979,6 +2101,14 @@ module.exports = function (io) {
                     'Update customer account error:',
                     error
                 )
+
+                if (error.code === '23505') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'This phone number is already registered at this location.',
+                        code: 40900
+                    })
+                }
 
                 return res.status(500).json({
                     success: false,
