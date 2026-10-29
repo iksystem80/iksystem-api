@@ -1202,14 +1202,15 @@ router.post('/close-to-admin-and-clockout', requireModuleAccess('transaction.emp
         if (Number(actualCash) > 0) {
             await client.query(`
                 INSERT INTO "LocationCashEntries"
-                    ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes")
-                VALUES ($1,$2,$3,'EMPLOYEE_CASH_TAKEN',$4,$5)`,
+                    ("LocationId","AccountId","Amount","Kind","CreatedBy","Notes","SessionClosingId")
+                VALUES ($1,$2,$3,'EMPLOYEE_CASH_TAKEN',$4,$5,$6)`,
                 [
                     s.LocationId,
                     destination.rows[0].ID,
                     actualCash,
                     s.UserId,
-                    note(req.body.notes) || `Shift close cash from employee session #${s.ID}`
+                    note(req.body.notes) || `Shift close cash from employee session #${s.ID}`,
+                    s.ID
                 ])
         }
 
@@ -2083,6 +2084,151 @@ router.get('/admin/current-money-trail', requireModuleAccess('transaction.employ
     }
 })
 
+
+// Admin-only correction of physical cash counted when an employee closed a shift.
+// Every linked ledger change and audit entry must succeed together.
+router.post('/admin/correct-shift-closing', requireModuleAccess('transaction.admin'), async (req, res) => {
+    const sessionId = Number(req.body.sessionid)
+    const locationId = Number(req.body.locationid)
+    const newActual = money(req.body.actualcash, true)
+    const expectedActual = money(req.body.expectedactualcash, true)
+    const reason = String(req.body.reason || '').trim()
+
+    if (!validId(sessionId) || !validId(locationId) || newActual === null || expectedActual === null)
+        return fail(res, 400, 'A valid session, location, and cash amount are required.')
+    if (reason.length < 5 || reason.length > 500)
+        return fail(res, 400, 'Enter a correction reason (5–500 characters).')
+    if (String(req.authUser?.roleName || '').trim().toLowerCase() !== 'admin')
+        return fail(res, 403, 'Admin access required.')
+
+    const client = await pool.connect()
+    try {
+        await client.query('BEGIN')
+        if (!(await authorizedLocation(client, req, locationId))) {
+            await client.query('ROLLBACK')
+            return fail(res, 403, 'Location access denied.')
+        }
+        // Serialize corrections with Admin custody changes for this location.
+        await client.query('SELECT pg_advisory_xact_lock(80471,$1::integer)', [locationId])
+
+        const closingResult = await client.query(`
+            SELECT c."SessionId",c."LocationId",c."ClosingBalance",c."ActualCash",
+                   c."Variance",c."HandoverId", es."ReadingSessionId",es."ClockOut"
+            FROM "SessionCashClosings" c
+            JOIN "EmployeeSession" es ON es."ID"=c."SessionId"
+            WHERE c."SessionId"=$1 AND c."LocationId"=$2
+            FOR UPDATE OF c,es
+        `, [sessionId, locationId])
+        const closing = closingResult.rows[0]
+        if (!closing || !closing.ClockOut || closing.ReadingSessionId != null) {
+            await client.query('ROLLBACK')
+            return fail(res, 409, 'Only closed shifts not included in a Reading Session can be corrected.')
+        }
+        if (Number(closing.ActualCash).toFixed(2) !== expectedActual) {
+            await client.query('ROLLBACK')
+            return fail(res, 409, 'The closing amount has changed. Refresh the money trail and try again.')
+        }
+        if (newActual === expectedActual) {
+            await client.query('ROLLBACK')
+            return fail(res, 400, 'The corrected amount is the same as the current amount.')
+        }
+        const delta = (Number(newActual) - Number(expectedActual)).toFixed(2)
+        const newVariance = (Number(newActual) - Number(closing.ClosingBalance)).toFixed(2)
+
+        if (closing.HandoverId != null) {
+            const handoverResult = await client.query(`
+                SELECT * FROM "SessionCashHandovers"
+                WHERE "ID"=$1 AND "LocationId"=$2 AND "FromSessionId"=$3
+                FOR UPDATE
+            `, [closing.HandoverId, locationId, sessionId])
+            const handover = handoverResult.rows[0]
+            if (!handover || !['Pending', 'Accepted'].includes(handover.Status) ||
+                Number(handover.Amount).toFixed(2) !== expectedActual) {
+                await client.query('ROLLBACK')
+                return fail(res, 409, 'The original handover cannot be verified.')
+            }
+            if (handover.Status === 'Accepted') {
+                const credit = await client.query(`
+                    SELECT "ID","SessionId","Amount" FROM "SessionCashTransactions"
+                    WHERE "TransferId"=$1 AND "LocationId"=$2 AND "Type"='OPENING_TRANSFER'
+                    FOR UPDATE
+                `, [handover.ID, locationId])
+                if (credit.rowCount !== 1 || Number(credit.rows[0].Amount).toFixed(2) !== expectedActual ||
+                    Number(credit.rows[0].SessionId) !== Number(handover.ToSessionId)) {
+                    await client.query('ROLLBACK')
+                    return fail(res, 409, 'The accepted recipient credit does not match the handover.')
+                }
+                const recipient = await client.query(`
+                    SELECT "ID","ReadingSessionId" FROM "EmployeeSession"
+                    WHERE "ID"=$1 AND "LocationId"=$2 FOR UPDATE
+                `, [handover.ToSessionId, locationId])
+                if (!recipient.rowCount || recipient.rows[0].ReadingSessionId != null) {
+                    await client.query('ROLLBACK')
+                    return fail(res, 409, 'Recipient session is already in a Reading Session; correction requires reconciliation review.')
+                }
+                // Recipient cash credit changes, but their physically counted cash does not.
+                // Recalculate any recipient closing's expected balance and variance.
+                await client.query(`
+                    UPDATE "SessionCashTransactions" SET "Amount"=$1 WHERE "ID"=$2
+                `, [newActual, credit.rows[0].ID])
+                await client.query(`
+                    UPDATE "SessionCashClosings"
+                    SET "ClosingBalance"=ROUND(("ClosingBalance"+$1::numeric),2),
+                        "Variance"=ROUND(("ActualCash"-("ClosingBalance"+$1::numeric)),2)
+                    WHERE "SessionId"=$2 AND "LocationId"=$3
+                `, [delta, handover.ToSessionId, locationId])
+            }
+            await client.query(`UPDATE "SessionCashHandovers" SET "Amount"=$1 WHERE "ID"=$2`,
+                [newActual, handover.ID])
+        } else {
+            // Unlike employee handovers, Admin custody entries require an exact
+            // SessionClosingId link. Never guess using Notes, date, or amount.
+            const entry = await client.query(`
+                SELECT "ID","AccountId","Amount" FROM "LocationCashEntries"
+                WHERE "SessionClosingId"=$1 AND "LocationId"=$2 AND "Kind"='EMPLOYEE_CASH_TAKEN'
+                FOR UPDATE
+            `, [sessionId, locationId])
+            if (entry.rowCount !== 1 || Number(entry.rows[0].Amount).toFixed(2) !== expectedActual) {
+                await client.query('ROLLBACK')
+                return fail(res, 409, 'Linked Admin custody entry is missing or mismatched. Link the historical entry first.')
+            }
+            const cashAccount = await client.query(`
+                SELECT COALESCE(SUM("Amount"),0)::numeric AS balance
+                FROM "LocationCashEntries" WHERE "AccountId"=$1
+            `, [entry.rows[0].AccountId])
+            if (Number(cashAccount.rows[0].balance) + Number(delta) < 0) {
+                await client.query('ROLLBACK')
+                return fail(res, 409, 'Correction would make the Admin custody balance negative.')
+            }
+            await client.query(`UPDATE "LocationCashEntries" SET "Amount"=$1 WHERE "ID"=$2`,
+                [newActual, entry.rows[0].ID])
+        }
+
+        await client.query(`
+            UPDATE "SessionCashClosings"
+            SET "ActualCash"=$1, "Variance"=$2 WHERE "SessionId"=$3 AND "LocationId"=$4
+        `, [newActual, newVariance, sessionId, locationId])
+
+        await client.query(`
+            INSERT INTO "SessionCashClosingCorrections"
+                ("SessionId","LocationId","OldActualCash","NewActualCash",
+                 "OldVariance","NewVariance","Reason","CorrectedBy")
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `, [sessionId, locationId, expectedActual, newActual,
+            closing.Variance, newVariance, reason, Number(req.authUser.id)])
+
+        await client.query('COMMIT')
+        emitAppRefresh(locationId, ['adminTransactions','employeeSessions'], 'shift-cash-corrected', { sessionId })
+        return ok(res, { sessionId, oldActual: expectedActual, newActual, variance: newVariance },
+            'Shift closing amount corrected and related records updated.')
+    } catch (e) {
+        try { await client.query('ROLLBACK') } catch {}
+        console.error('Admin shift closing correction:', e)
+        return fail(res, 500, 'Unable to correct shift closing.')
+    } finally {
+        client.release()
+    }
+})
 
 // Admin live cash ledger used by AdminTransactions.vue.
 // Returns only the signed-in Admin's custody account entries.

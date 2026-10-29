@@ -17,7 +17,8 @@ console.log('current:' + USE_HTTPS)
 // CORS_ALLOWED_ORIGINS can add environment-specific origins as a comma-separated
 // list without requiring another code change (for example, a new dev device).
 const allowedOrigins = new Set([
-  'https://secure.iklogy.com',
+    'https://secure.iklogy.com',
+    'https://demo.iklogy.com',
   'https://iklogy.com',
   'https://localhost',
   'https://localhost:5173',

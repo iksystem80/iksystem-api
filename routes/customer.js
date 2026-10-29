@@ -1678,6 +1678,7 @@ module.exports = function (io) {
                 const locationId = Number(data.locationid)
                 const employeeId = Number(req.authUser?.id)
                 const points = Number(data.points ?? data.amount)
+                const machineNumber = String(data.machineNumber ?? '').trim()
 
                 if (!Number.isInteger(customerId) || customerId <= 0)
                     return res.status(400).json({ success: false, message: 'Valid customer is required.', code: 40000 })
@@ -1687,6 +1688,8 @@ module.exports = function (io) {
                     return res.status(401).json({ success: false, message: 'Authenticated employee is required.', code: 40100 })
                 if (!Number.isFinite(points) || points <= 0)
                     return res.status(400).json({ success: false, message: 'Amount must be greater than zero.', code: 40000 })
+                if (!/^\d+$/.test(machineNumber) || Number(machineNumber) <= 0)
+                    return res.status(400).json({ success: false, message: 'Valid machine number is required.', code: 40000 })
                 if (!req.file)
                     return res.status(400).json({ success: false, message: 'Customer points photo is required.', code: 40000 })
 
@@ -1713,13 +1716,22 @@ module.exports = function (io) {
                     return res.status(404).json({ success: false, message: 'Customer not found for this location.', code: 40400 })
                 }
 
+                const machineResult = await client.query(`
+                    SELECT m."ID" AS id FROM "Machines" m
+                    WHERE m.locationid=$1 AND m."MachineNumber"::text=$2
+                    LIMIT 1`, [locationId, machineNumber])
+                if (!machineResult.rowCount) {
+                    await client.query('ROLLBACK')
+                    return res.status(400).json({ success: false, message: 'Machine number not found for this location.', code: 40000 })
+                }
+
                 const imageResult = await uploadToCloudinary(req.file.buffer, 'MatchPoints')
                 const result = await client.query(`
                     INSERT INTO public."CustomerMatch"
                     ("CustomerId","MachineId","Points","DateAssign","ImageUrl","AssignedBy","LocationId","CheckinId","EmployeeSessionId","IsExtraMatch")
-                    VALUES ($1,NULL,$2,NOW(),$3,$4,$5,NULL,$6,true)
+                    VALUES ($1,$2,$3,NOW(),$4,$5,$6,NULL,$7,true)
                     RETURNING "ID" AS id`,
-                    [customerId, points, imageResult.secure_url, employeeId, locationId, sessionResult.rows[0].ID])
+                    [customerId, machineResult.rows[0].id, points, imageResult.secure_url, employeeId, locationId, sessionResult.rows[0].ID])
 
                 await client.query('COMMIT')
                 return res.status(201).json({ success: true, message: 'Extra Match saved successfully!', code: 20000, data: result.rows[0] })

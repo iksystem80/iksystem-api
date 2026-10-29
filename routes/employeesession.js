@@ -1165,6 +1165,7 @@ router.get(
                     m."MachineTypeId" AS "machineTypeId",
                     COALESCE(NULLIF(BTRIM(mt."TypeName"), ''), 'Unassigned') AS "machineTypeName",
                     cm."Points"::double precision AS "points",
+                    COALESCE(cm."IsExtraMatch", false) AS "isExtraMatch",
                     cm."DateAssign" AS "dateAssign",
                     cm."ImageUrl" AS "imageUrl",
                     cm."AssignedBy" AS "assignedBy",
