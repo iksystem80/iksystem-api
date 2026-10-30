@@ -93,11 +93,28 @@ async function getAuthenticatedUser(req) {
                     c."ID" = l."CompanyId"
 
             WHERE
-                u."token" = $1
-
-                AND
-
-                u."TokenExpiresAt" > NOW()
+                (
+                    -- Employees keep the original single-session token.
+                    (
+                        LOWER(BTRIM(r."Name")) = 'employee'
+                        AND u."token" = $1
+                        AND u."TokenExpiresAt" > NOW()
+                    )
+                    OR
+                    -- Other roles may have multiple independently valid sessions.
+                    (
+                        LOWER(BTRIM(r."Name")) <> 'employee'
+                        AND (
+                            (u."token" = $1 AND u."TokenExpiresAt" > NOW())
+                            OR EXISTS (
+                                SELECT 1 FROM "UserSessions" s
+                                WHERE s."UserId" = u."ID"
+                                  AND s."Token" = $1
+                                  AND s."ExpiresAt" > NOW()
+                            )
+                        )
+                    )
+                )
 
                 AND
 

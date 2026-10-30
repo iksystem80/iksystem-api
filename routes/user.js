@@ -358,19 +358,34 @@ router.post('/login', async (req, res) => {
             }
 
 
-            // Issue a fresh, unpredictable session token with a fixed expiry.
-            // The existing frontend token property and header contract are unchanged.
+            // Issue a fresh, unpredictable token. Keep the existing frontend
+            // token/header contract and 24-hour expiry for every role.
             const sessionToken = crypto.randomBytes(32).toString('hex')
-            await client.query(`
-                UPDATE "Users"
-                SET "token" = $1,
-                    "TokenExpiresAt" = NOW() + INTERVAL '24 hours',
-                    "DateUpdated" = NOW()
-                WHERE "ID" = $2
-            `, [sessionToken, user.ID])
+            if (roleName === 'employee') {
+                // Unchanged employee behavior: replace the previous session,
+                // then send the same takeover notification after commit.
+                await client.query(`
+                    UPDATE "Users"
+                    SET "token" = $1,
+                        "TokenExpiresAt" = NOW() + INTERVAL '24 hours',
+                        "DateUpdated" = NOW()
+                    WHERE "ID" = $2
+                `, [sessionToken, user.ID])
 
-            if (typeof user.token === 'string' && user.token) {
-                replacedSession = { userId: user.ID, oldToken: user.token, newToken: sessionToken }
+                if (typeof user.token === 'string' && user.token) {
+                    replacedSession = { userId: user.ID, oldToken: user.token, newToken: sessionToken }
+                }
+            } else {
+                // Non-employees retain other active device sessions. Legacy
+                // Users.token remains valid until its existing expiry.
+                await client.query(`
+                    DELETE FROM "UserSessions"
+                    WHERE "UserId" = $1 AND "ExpiresAt" <= NOW()
+                `, [user.ID])
+                await client.query(`
+                    INSERT INTO "UserSessions" ("UserId", "Token", "ExpiresAt")
+                    VALUES ($1, $2, NOW() + INTERVAL '24 hours')
+                `, [user.ID, sessionToken])
             }
 
             return resultResponse(200, {
