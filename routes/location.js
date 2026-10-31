@@ -54,6 +54,9 @@ router.get(
                         COALESCE(l."AllowFaceCheckin", false)
                             AS "allowFaceCheckin",
 
+                        COALESCE(l."IsPromotionAllowed", false)
+                            AS "isPromotionAllowed",
+
                         COUNT(
                             u."ID"
                         )::integer
@@ -123,8 +126,26 @@ router.post(
         try {
             const {
                 companyId,
-                name
+                name,
+                allowFaceCheckin = false,
+                isPromotionAllowed = false
             } = req.body
+
+            if (typeof allowFaceCheckin !== 'boolean') {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message: 'Allow Face Check-In must be true or false.'
+                })
+            }
+
+            if (typeof isPromotionAllowed !== 'boolean') {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message: 'Allow Promotions must be true or false.'
+                })
+            }
 
             if (
                 !Number.isSafeInteger(Number(companyId)) ||
@@ -209,7 +230,9 @@ router.post(
                         "name",
                         "CompanyId",
                         "IsActive",
-                        "IsSuspended"
+                        "IsSuspended",
+                        "AllowFaceCheckin",
+                        "IsPromotionAllowed"
                     )
 
                     VALUES
@@ -217,7 +240,9 @@ router.post(
                         $1,
                         $2,
                         true,
-                        false
+                        false,
+                        $3,
+                        $4
                     )
 
                     RETURNING
@@ -225,11 +250,15 @@ router.post(
                         "name",
                         "CompanyId",
                         "IsActive",
-                        "IsSuspended"
+                        "IsSuspended",
+                        "AllowFaceCheckin" AS "allowFaceCheckin",
+                        "IsPromotionAllowed" AS "isPromotionAllowed"
                     `,
                     [
                         name.trim(),
-                        companyId
+                        companyId,
+                        allowFaceCheckin,
+                        isPromotionAllowed
                     ]
                 )
 
@@ -269,7 +298,7 @@ router.put(
     async (req, res) => {
         try {
             const locationId = Number(req.params.id)
-            const { name, allowFaceCheckin, isActive, isSuspended, status } = req.body
+            const { name, allowFaceCheckin, isPromotionAllowed, isActive, isSuspended, status } = req.body
 
             if (!Number.isInteger(locationId) || locationId <= 0 ||
                 typeof name !== 'string' || !name.trim() || name.trim().length > 100) {
@@ -288,6 +317,14 @@ router.put(
                 })
             }
 
+            if (isPromotionAllowed !== undefined && typeof isPromotionAllowed !== 'boolean') {
+                return res.status(400).json({
+                    success: false,
+                    code: 40000,
+                    message: 'Allow Promotions must be true or false.'
+                })
+            }
+
             if ((isActive !== undefined && typeof isActive !== 'boolean') ||
                 (isSuspended !== undefined && typeof isSuspended !== 'boolean')) {
                 return res.status(400).json({
@@ -298,7 +335,8 @@ router.put(
 
             const currentResult = await pool.query(`
                 SELECT "ID", "CompanyId", "IsActive", "IsSuspended",
-                       COALESCE("AllowFaceCheckin", false) AS "allowFaceCheckin"
+                       COALESCE("AllowFaceCheckin", false) AS "allowFaceCheckin",
+                       COALESCE("IsPromotionAllowed", false) AS "isPromotionAllowed"
                 FROM "Locations" WHERE "ID" = $1
             `, [locationId])
 
@@ -369,13 +407,17 @@ router.put(
             const result = await pool.query(`
                 UPDATE "Locations"
                 SET "name" = $1, "AllowFaceCheckin" = $2,
-                    "IsActive" = $3, "IsSuspended" = $4
-                WHERE "ID" = $5
+                    "IsActive" = $3, "IsSuspended" = $4,
+                    "IsPromotionAllowed" = $5
+                WHERE "ID" = $6
                 RETURNING "ID" AS "id", "name", "CompanyId" AS "companyId",
                           "IsActive" AS "isActive", "IsSuspended" AS "isSuspended",
-                          "AllowFaceCheckin" AS "allowFaceCheckin"
+                          "AllowFaceCheckin" AS "allowFaceCheckin",
+                          "IsPromotionAllowed" AS "isPromotionAllowed"
             `, [name.trim(), allowFaceCheckin === undefined ? current.allowFaceCheckin : allowFaceCheckin,
-                nextIsActive, nextIsSuspended, locationId])
+                nextIsActive, nextIsSuspended,
+                isPromotionAllowed === undefined ? current.isPromotionAllowed : isPromotionAllowed,
+                locationId])
 
             const updatedLocation = result.rows[0]
             const updatedStatus = updatedLocation.isSuspended
