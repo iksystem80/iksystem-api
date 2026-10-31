@@ -1044,7 +1044,7 @@ module.exports = function (io) {
                 // SAVE CHECK-IN
                 // ====================================================
 
-                await pool.query(
+                const savedCheckin = await pool.query(
                     `
                 INSERT INTO "CheckIn"
                 (
@@ -1064,6 +1064,7 @@ module.exports = function (io) {
                     false,
                     $4
                 )
+                RETURNING "ID"
                 `,
                     [
                         customer.id,
@@ -1071,6 +1072,16 @@ module.exports = function (io) {
                         photoUrl,
                         distance
                     ]
+                )
+
+                const consentResult = await pool.query(`
+                    SELECT mc."Status" AS status
+                    FROM "CustomerMarketingConsent" mc
+                    WHERE mc."CustomerId"=$1 AND mc.locationid=$2
+                `, [customer.id, mycheckin.locationid])
+                const locationResult = await pool.query(
+                    'SELECT name, COALESCE("IsPromotionAllowed", false) AS "isPromotionAllowed" FROM "Locations" WHERE "ID"=$1',
+                    [mycheckin.locationid]
                 )
 
                 // ====================================================
@@ -1116,6 +1127,11 @@ module.exports = function (io) {
                             firstname: customer.firstname,
                             lastname: customer.lastname,
                             avatar: customer.avatar || null,
+                            hasMarketingPhone: Boolean(customer.phone),
+                            marketingConsentStatus: consentResult.rows[0]?.status || null,
+                            isPromotionAllowed: locationResult.rows[0]?.isPromotionAllowed === true,
+                            locationname: locationResult.rows[0]?.name || 'this location',
+                            checkinid: savedCheckin.rows[0].ID,
                         },
                     })
 
@@ -1142,6 +1158,61 @@ module.exports = function (io) {
         }
     )
 
+
+    // Record a tablet customer's explicit, location-specific marketing choice.
+    // A fresh check-in is required; phone verification alone never grants consent.
+    router.post('/marketing-consent', requireModuleAccess('checkin'),
+        requireCustomerUploadLocation, async (req, res) => {
+            const customerid = Number(req.body?.customerid)
+            const locationid = Number(req.body?.locationid)
+            const checkinid = Number(req.body?.checkinid)
+            const status = req.body?.status
+            const disclosureVersion = 'tablet-marketing-v1'
+
+            if (![customerid, locationid, checkinid].every(n => Number.isSafeInteger(n) && n > 0) ||
+                !['opted_in', 'declined'].includes(status)) {
+                return res.status(400).json({ success: false, code: 40000, message: 'Invalid marketing consent request.' })
+            }
+
+            const client = await pool.connect()
+            try {
+                await client.query('BEGIN')
+                const checkedIn = await client.query(`
+                    SELECT c."Phone", l.name
+                    FROM "CheckIn" ci
+                    JOIN "Customer" c ON c."ID"=ci."CustomerId" AND c.locationid=ci."LocationId"
+                    JOIN "Locations" l ON l."ID"=ci."LocationId" AND COALESCE(l."IsPromotionAllowed", false)=true
+                    WHERE ci."ID"=$1 AND ci."CustomerId"=$2 AND ci."LocationId"=$3
+                      AND ci."CheckInDate" >= NOW() - INTERVAL '10 minutes'
+                    LIMIT 1
+                `, [checkinid, customerid, locationid])
+                if (!checkedIn.rowCount || !checkedIn.rows[0].Phone) {
+                    await client.query('ROLLBACK')
+                    return res.status(403).json({ success: false, code: 40300, message: 'Recent eligible check-in required.' })
+                }
+
+                const disclosureText = `I agree to receive recurring promotional SMS/MMS (including images) from ${checkedIn.rows[0].name} at my provided phone number. Consent is optional and is not required to check in or make a purchase. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for help.`
+                await client.query(`
+                    INSERT INTO "CustomerMarketingConsent" ("CustomerId",locationid,"Status","DisclosureVersion","UpdatedAt")
+                    VALUES ($1,$2,$3,$4,NOW())
+                    ON CONFLICT ("CustomerId",locationid) DO UPDATE SET
+                        "Status"=EXCLUDED."Status", "DisclosureVersion"=EXCLUDED."DisclosureVersion", "UpdatedAt"=NOW()
+                `, [customerid, locationid, status, disclosureVersion])
+                await client.query(`
+                    INSERT INTO "CustomerMarketingConsentEvents"
+                        ("CustomerId",locationid,"CheckInId","Status","DisclosureVersion","DisclosureText")
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                `, [customerid, locationid, checkinid, status, disclosureVersion, disclosureText])
+                await client.query('COMMIT')
+                return res.json({ success: true, code: 20000, status })
+            } catch (error) {
+                await client.query('ROLLBACK')
+                console.error('Marketing consent save error:', error)
+                return res.status(500).json({ success: false, code: 50000, message: 'Unable to save marketing preference.' })
+            } finally {
+                client.release()
+            }
+        })
 
     // ============================================================
     // CHECK-OUT

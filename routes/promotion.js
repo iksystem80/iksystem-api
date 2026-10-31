@@ -364,6 +364,27 @@ router.put(
   }
 )
 
+// Consent is specific to the selected business location, not the platform.
+// Return only IDs; the existing customer API supplies customer details.
+router.get('/consented-customers', selectedPromotionLocation,
+  requireModuleAccess('promotions.list'), requirePromotionLocationAccess,
+  async (req, res) => {
+    try {
+      const result = await pool.query(`
+        SELECT mc."CustomerId" AS id
+        FROM "CustomerMarketingConsent" mc
+        JOIN "Customer" c ON c."ID"=mc."CustomerId" AND c.locationid=mc.locationid
+        WHERE mc.locationid=$1 AND mc."Status"='opted_in'
+          AND c."IsActive"=true AND COALESCE(c."IsBlacklist",false)=false
+          AND NULLIF(BTRIM(COALESCE(c."Phone",'')), '') IS NOT NULL
+      `, [locationId(req)])
+      return res.json({ success: true, code: 20000, data: result.rows.map(r => Number(r.id)) })
+    } catch (error) {
+      console.error('Promotion consent lookup error:', error)
+      return res.status(500).json({ success: false, code: 50000, message: 'Unable to load consent eligibility.' })
+    }
+  })
+
 router.post(
   '/recipients',
   selectedPromotionLocation,
@@ -483,6 +504,12 @@ router.post(
                   ),
                   ''
                 ) IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM "CustomerMarketingConsent" mc
+                  WHERE mc."CustomerId"=c."ID"
+                    AND mc.locationid=c.locationid
+                    AND mc."Status"='opted_in'
+                )
             `,
             [
               requestedCustomerIds,
@@ -503,7 +530,7 @@ router.post(
             success: false,
             code: 40000,
             message:
-              'One or more selected customers are no longer eligible for this promotion.'
+              'One or more selected customers lack active promotional consent or are no longer eligible.'
           })
         }
 
@@ -674,6 +701,29 @@ router.post(
         success: false,
         code: 40000,
         message: 'Promotion has no recipients.'
+      })
+    }
+
+    // Consent may have been withdrawn since the draft recipients were saved.
+    // Never queue a campaign containing ineligible recipients.
+    const ineligibleResult = await pool.query(`
+      SELECT COUNT(*)::integer AS count
+      FROM "PromotionRecipients" pr
+      JOIN "Promotions" p ON p."ID"=pr."PromotionId"
+      LEFT JOIN "Customer" c ON c."ID"=pr."CustomerId" AND c.locationid=p."LocationId"
+      LEFT JOIN "CustomerMarketingConsent" mc
+        ON mc."CustomerId"=c."ID" AND mc.locationid=p."LocationId"
+      WHERE pr."PromotionId"=$1 AND p."CompanyId"=$2 AND p."LocationId"=$3
+        AND (c."ID" IS NULL OR c."IsActive" IS DISTINCT FROM true
+             OR COALESCE(c."IsBlacklist",false)=true
+             OR NULLIF(BTRIM(COALESCE(c."Phone",'')),'') IS NULL
+             OR c."Phone" IS DISTINCT FROM pr."Phone"
+             OR mc."Status" IS DISTINCT FROM 'opted_in')
+    `, [id, cid, locationId(req)])
+    if (ineligibleResult.rows[0].count > 0) {
+      return res.status(400).json({
+        success: false, code: 40000,
+        message: `${ineligibleResult.rows[0].count} recipient(s) no longer have active eligibility or marketing consent. Refresh recipients before sending.`
       })
     }
 
