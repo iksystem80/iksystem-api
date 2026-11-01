@@ -153,6 +153,7 @@ module.exports = function (io) {
                     const first = String(item.first_name || item.firstname || '').trim()
                     const last = String(item.last_name || item.lastname || '').trim()
                     const phone = String(item.phone || '').replace(/\D/g, '')
+                    const points = Number(item.points ?? 0)
                     const identity = { row: item.row || i + 1, first_name: first, last_name: last, phone }
                     const skip = reason => rejected.push({ ...identity, reason })
                     try {
@@ -160,6 +161,9 @@ module.exports = function (io) {
                             skip('Missing or invalid first/last name'); continue
                         }
                         if (phone.length !== 10) { skip('Phone must contain exactly 10 digits'); continue }
+                        if (!Number.isFinite(points) || points < 0 || points > 999999999) {
+                            skip('Points must be a valid non-negative number'); continue
+                        }
                         if (seen.has(phone)) { skip('Duplicate phone within uploaded JSON'); continue }
                         seen.add(phone)
                         const exists = await pool.query('SELECT 1 FROM "Customer" WHERE "locationid"=$1 AND "Phone"=$2 LIMIT 1', [locationId, phone])
@@ -178,11 +182,11 @@ module.exports = function (io) {
                         const saved = await pool.query(`
                             INSERT INTO "Customer" ("Firstname", "Lastname", "DOB", "avatar", "Phone", "DateCreated",
                                 "locationid", "IsActive", "PhoneVerified", "PhoneVerifiedAt", "VerificationMethod",
-                                "Embedding", "CreatedBy", "IsVIP", "IsBlacklist")
-                            VALUES ($1, $2, NULL, $3, $4, NOW(), $5, true, false, NULL, NULL, $6, $7, false, false)
+                                "Embedding", "CreatedBy", "IsVIP", "IsBlacklist", "Points")
+                            VALUES ($1, $2, NULL, $3, $4, NOW(), $5, true, false, NULL, NULL, $6, $7, false, false, $8)
                             ON CONFLICT DO NOTHING
                             RETURNING "ID"`, [first, last, cloud.secure_url, phone, locationId,
-                            embedding === null ? null : pgvector.toSql(embedding), req.authUser.id])
+                            embedding === null ? null : pgvector.toSql(embedding), req.authUser.id, points])
                         if (saved.rowCount) imported++
                         else skip('Phone already registered at this location')
                     } catch (error) {
@@ -481,9 +485,49 @@ module.exports = function (io) {
         requireCustomerUploadLocation,
         async (req, res) => {
             try {
-                const {
-                    locationid
-                } = req.query
+                const { locationid, page = '1', pageSize = '50', search = '', status = 'all', verification = 'all' } = req.query
+                const currentPage = Number(page)
+                const perPage = Number(pageSize)
+                if (!Number.isSafeInteger(currentPage) || currentPage < 1 ||
+                    !Number.isSafeInteger(perPage) || ![25, 50, 100, 200].includes(perPage)) {
+                    return res.status(400).json({ success: false, message: 'Invalid pagination parameters.' })
+                }
+
+                const filters = ['c."locationid" = $1']
+                const values = [Number(locationid)]
+                if (status === '1' || status === '0') {
+                    values.push(status === '1')
+                    filters.push(`c."IsActive" = $${values.length}`)
+                }
+                if (verification !== 'all') {
+                    if (!['verified', 'unverified', 'bypass'].includes(verification)) {
+                        return res.status(400).json({ success: false, message: 'Invalid verification filter.' })
+                    }
+                    filters.push(verification === 'verified'
+                        ? 'c."PhoneVerified" IS TRUE'
+                        : verification === 'bypass'
+                            ? `c."PhoneVerified" IS NOT TRUE AND LOWER(COALESCE(c."VerificationMethod", '')) = 'bypass'`
+                            : `c."PhoneVerified" IS NOT TRUE AND LOWER(COALESCE(c."VerificationMethod", '')) <> 'bypass'`)
+                }
+                if (String(search).trim()) {
+                    values.push(`%${String(search).trim()}%`)
+                    filters.push(`(COALESCE(c."Firstname", '') ILIKE $${values.length}
+                        OR COALESCE(c."Lastname", '') ILIKE $${values.length}
+                        OR CONCAT_WS(' ', c."Firstname", c."Lastname") ILIKE $${values.length}
+                        OR COALESCE(c."Phone"::text, '') ILIKE $${values.length}
+                        OR TO_CHAR(c."DOB", 'MM/DD/YYYY') ILIKE $${values.length}
+                        OR TO_CHAR(c."DateCreated", 'MM/DD/YYYY') ILIKE $${values.length}
+                        OR COALESCE(c."Points"::text, '') ILIKE $${values.length}
+                        OR EXISTS (SELECT 1 FROM "CheckIn" v WHERE v."CustomerId" = c."ID"
+                            AND v."LocationId" = c."locationid"
+                            AND TO_CHAR(v."CheckInDate", 'MM/DD/YYYY HH12:MI AM') ILIKE $${values.length}))`)
+                }
+                const where = filters.join(' AND ')
+                const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM "Customer" c
+                    INNER JOIN "Users" u ON u."ID" = c."CreatedBy" WHERE ${where}`, values)
+                const total = totalResult.rows[0].total
+                const paginated = req.query.page !== undefined
+                if (paginated) values.push(perPage, (currentPage - 1) * perPage)
 
                 const result =
                     await pool.query(
@@ -531,16 +575,15 @@ module.exports = function (io) {
                                c."CreatedBy"
 
                         WHERE
-                            c."locationid" = $1
+                            ${where}
 
                         ORDER BY
                             LOWER(c."Firstname") ASC,
                             LOWER(c."Lastname") ASC,
                             c."ID" ASC
+                        ${paginated ? `LIMIT $${values.length - 1} OFFSET $${values.length}` : ''}
                         `,
-                        [
-                            locationid
-                        ]
+                        values
                     )
 
                 if (
@@ -553,8 +596,8 @@ module.exports = function (io) {
                             message:
                                 'Success!',
                             code: 20000,
-                            data:
-                                result.rows,
+                            data: result.rows,
+                            pagination: { page: currentPage, pageSize: perPage, total },
                         })
                 } else {
                     return res
@@ -564,7 +607,8 @@ module.exports = function (io) {
                             message:
                                 'there is no customers',
                             code: 20000,
-                            data: []
+                            data: [],
+                            pagination: { page: currentPage, pageSize: perPage, total }
                         })
                 }
             } catch (error) {
