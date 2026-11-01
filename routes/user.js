@@ -13,7 +13,8 @@ const {
     notifySessionReplaced,
     findSessionReview,
     forgetSessionReview,
-    notifySessionRevoked
+    notifySessionRevoked,
+    notifyActiveLoginCount
 } = require('../utils/realtime')
 
 // ============================================================
@@ -57,6 +58,32 @@ async function uploadProfileImage(fileBuffer) {
 // ============================================================
 
 const crypto = require('crypto')
+
+async function activeLoginCount(userId) {
+    const result = await pool.query(`
+        SELECT COUNT(DISTINCT active."Token")::int AS "count"
+        FROM (
+            SELECT u."token" AS "Token"
+            FROM "Users" u
+            WHERE u."ID" = $1 AND u."token" IS NOT NULL
+              AND u."TokenExpiresAt" > NOW()
+            UNION ALL
+            SELECT s."Token"
+            FROM "UserSessions" s
+            WHERE s."UserId" = $1 AND s."ExpiresAt" > NOW()
+        ) active
+    `, [userId])
+    return Number(result.rows[0]?.count || 0)
+}
+
+async function publishActiveLoginCount(userId) {
+    try {
+        notifyActiveLoginCount(userId, await activeLoginCount(userId))
+    } catch (error) {
+        // Login/logout must remain usable if the nonessential badge refresh fails.
+        console.error('Unable to publish active login count:', error)
+    }
+}
 
 // PostgreSQL-backed failed-login limits: 3 failures per 60 seconds, followed by
 // a 60-second restriction. Both account and IP are counted. Shared by all
@@ -413,6 +440,9 @@ router.post('/login', async (req, res) => {
                 console.error('Login replacement notification error:', notificationError)
             }
         }
+        if (response.status === 200) {
+            await publishActiveLoginCount(response.data.userid)
+        }
         return res.status(response.status).json(response.data)
     } catch (error) {
         if (inTransaction) await client.query('ROLLBACK').catch(() => {})
@@ -420,6 +450,40 @@ router.post('/login', async (req, res) => {
         return res.status(500).json({ success: false, code: 50000, message: 'Unable to sign in.' })
     } finally {
         client.release()
+    }
+})
+
+// Count valid authenticated tokens, never browser tabs or socket connections.
+router.get('/active-login-count', authenticate, async (req, res) => {
+    try {
+        const count = await activeLoginCount(req.authUser.id)
+        return res.json({ success: true, count })
+    } catch (error) {
+        console.error('Unable to read active login count:', error)
+        return res.status(500).json({ success: false, message: 'Unable to read sessions.' })
+    }
+})
+
+// Revoke precisely the token supplied by this authenticated request.
+router.post('/logout', authenticate, async (req, res) => {
+    const token = req.headers['x-token'] ||
+        (typeof req.headers.authorization === 'string'
+            ? req.headers.authorization.replace(/^Bearer\s+/i, '') : '')
+    if (typeof token !== 'string' || !token) {
+        return res.status(400).json({ success: false, message: 'Session token is required.' })
+    }
+    try {
+        await pool.query(`DELETE FROM "UserSessions" WHERE "UserId" = $1 AND "Token" = $2`,
+            [req.authUser.id, token])
+        await pool.query(`
+            UPDATE "Users" SET "token" = NULL, "TokenExpiresAt" = NULL
+            WHERE "ID" = $1 AND "token" = $2
+        `, [req.authUser.id, token])
+        await publishActiveLoginCount(req.authUser.id)
+        return res.json({ success: true })
+    } catch (error) {
+        console.error('Logout session revocation failed:', error)
+        return res.status(500).json({ success: false, message: 'Unable to revoke session.' })
     }
 })
 

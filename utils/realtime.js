@@ -83,6 +83,19 @@ function setSocketIO(io) {
     socketIO = io || null
 }
 
+// Send only to sockets already authenticated as this user. A socket count is
+// never used as the session count; the database supplies the authoritative value.
+function notifyActiveLoginCount(userId, count) {
+    if (!socketIO || !Number.isSafeInteger(Number(userId))) return false
+    const activeCount = Math.max(0, Number(count) || 0)
+    for (const socket of socketIO.sockets.sockets.values()) {
+        if (Number(socket.data.user?.id) === Number(userId)) {
+            socket.emit('active-login-count', { count: activeCount })
+        }
+    }
+    return true
+}
+
 function cleanPositiveId(value) {
     const id = Number(value)
     return Number.isSafeInteger(id) && id > 0
@@ -172,6 +185,7 @@ module.exports = {
     findSessionReview,
     forgetSessionReview,
     notifySessionRevoked,
+    notifyActiveLoginCount,
     emitAppRefresh,
     emitAccessStatus,
     emitLocationsRefresh
